@@ -71,9 +71,35 @@ in {
       default = true;
       description = "Whether to enable shell integration (prompt hook for PATH updates).";
     };
+
+    overlay = lib.mkOption {
+      type = lib.types.unspecified;
+      readOnly = true;
+      description = ''
+        Generated nixpkgs overlay that replaces configured tools with their
+        lazy stubs. Apply this to nixpkgs so that any reference to the
+        package (e.g. `pkgs.ripgrep`) gets the stub automatically.
+
+        Tool names must match nixpkgs attribute names for the overlay to work.
+
+        Usage:
+          nixpkgs.overlays = [ config.programs.nix-stubs.overlay ];
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    programs.nix-stubs.overlay = lazyLib.mkOverlay (
+      lib.mapAttrs (name: tool:
+        let
+          commands =
+            if lib.isDerivation tool then null
+            else if tool.commands == [] then null
+            else { inherit (tool) commands; };
+        in
+        if commands == null then {} else commands
+      ) cfg.tools
+    );
     home.packages = shimPackages ++ [ nixStubsPkg ];
 
     # Shell integration — activate hook for dynamic PATH updates

@@ -55,6 +55,21 @@ let
     in
     writeText "nix-stubs-manifest.json" (builtins.toJSON manifestData);
 
+  # Overlay that replaces packages in nixpkgs with lazy stubs.
+  # tools: attrset mapping nixpkgs attribute names to config.
+  #   { commands = [ "rg" ]; }  — explicit command list
+  #   {}                        — infer commands from meta.mainProgram
+  mkOverlay = tools: final: prev:
+    lib.mapAttrs (name: toolCfg:
+      let
+        commands = if toolCfg == {} then null else toolCfg.commands or null;
+      in
+      mkLazyPackage {
+        package = prev.${name};
+        inherit name commands;
+      }
+    ) tools;
+
 in {
-  inherit mkLazyPackage mkManifest;
+  inherit mkLazyPackage mkManifest mkOverlay;
 }

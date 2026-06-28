@@ -69,6 +69,59 @@ That's it. After `home-manager switch`:
 | `package` | package | `nix-stubs` from flake | The nix-stubs binary to use |
 | `tools` | attrsOf (package or { package, commands }) | `{}` | Tools to create lazy shims for |
 | `enableShellIntegration` | bool | `true` | Add prompt hook for PATH updates |
+| `overlay` | overlay (read-only) | — | Generated nixpkgs overlay from configured tools |
+
+## Overlay
+
+The module exposes a read-only `overlay` option generated from your
+`tools` config. Apply it to nixpkgs so that any reference to the
+package (e.g. `pkgs.ripgrep`) gets the lazy stub automatically:
+
+```nix
+{ config, pkgs, ... }: {
+  programs.nix-stubs = {
+    enable = true;
+    tools = {
+      ripgrep = { package = pkgs.ripgrep; commands = [ "rg" ]; };
+      uv = pkgs.uv;
+    };
+  };
+
+  # Apply the generated overlay — pkgs.ripgrep and pkgs.uv are now lazy stubs
+  nixpkgs.overlays = [ config.programs.nix-stubs.overlay ];
+}
+```
+
+Tool names must match nixpkgs attribute names for the overlay to work.
+
+### Standalone `mkOverlay`
+
+You can also use `mkOverlay` directly without the module:
+
+```nix
+# flake.nix
+{
+  outputs = { nixpkgs, nix-stubs, ... }:
+    let
+      lazyOverlay = nix-stubs.lib.x86_64-linux.mkOverlay {
+        ripgrep = { commands = [ "rg" ]; };
+        uv = {};  # infer commands from meta.mainProgram
+      };
+    in {
+      nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+        modules = [{
+          nixpkgs.overlays = [ lazyOverlay ];
+          # Now pkgs.ripgrep and pkgs.uv are lazy stubs everywhere
+          environment.systemPackages = [ pkgs.ripgrep pkgs.uv ];
+        }];
+      };
+    };
+}
+```
+
+> **Note:** The overlay is intended for end-user CLI tools. Don't overlay
+> packages used as build inputs by other derivations — builds need the
+> real package, not a shim.
 
 ## Standalone usage
 
