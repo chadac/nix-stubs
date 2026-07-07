@@ -10,10 +10,17 @@ let
     name ? null,
   }:
     let
-      # drvPath WITH context — ensures .drv file is in the store
+      # drvPath WITH context — ensures the .drv (and its build inputs) are in the
+      # shim's closure, so the package can be realised on first use. We deliberately
+      # do NOT embed the realised OUT path: writing it into the shim as a literal
+      # /nix/store/… string makes Nix's REFERENCE SCANNER treat the full built
+      # package as a runtime dependency of the shim — pulling it into the closure
+      # and defeating the whole point (the shim would ship the package it's meant to
+      # lazily fetch). unsafeDiscardStringContext drops the BUILD-time context but
+      # NOT the scanner's textual match. Instead the dispatcher resolves the out
+      # path from the .drv at runtime (`nix-store --query --outputs`, which reads the
+      # drv's declared outputs WITHOUT realising them) — see resolve_out_path.
       drvPath = package.drvPath;
-      # outPath WITHOUT context — just a string, doesn't force building
-      outPath = unsafeDiscardStringContext (toString package);
 
       defaultBin = package.meta.mainProgram or (parseDrvName package.name).name;
       pkgName = if name != null then name else defaultBin;
@@ -23,7 +30,6 @@ let
         writeShellScriptBin bin ''
           exec ${nix-stubs}/bin/nix-stubs exec \
             --drv-path "${drvPath}" \
-            --out-path "${outPath}" \
             --bin "${bin}" \
             "${pkgName}" \
             -- "$@"
