@@ -120,6 +120,24 @@ in pkgs.testers.nixosTest {
         assert "lazy-test-output-success" in result, f"Expected output not found: {result}"
 
     # =========================================================
+    # Test 1b: THE lazy guarantee — the shim's closure must NOT contain the
+    # realised package. (Regression: embedding --out-path as a literal store path
+    # in the shim made Nix's reference scanner re-add the full package as a runtime
+    # dep, defeating laziness. The shim carries only the .drv now.)
+    # =========================================================
+    with subtest("shim closure EXCLUDES the realised package"):
+        shim = machine.succeed("readlink -f $(which lazy-test-tool)").strip()
+        # The shim is a symlink into the lazy-* symlinkJoin; walk to its real store
+        # path and query its runtime references.
+        refs = machine.succeed(f"nix-store -q --references $(nix-store -q --deriver {shim} >/dev/null 2>&1; echo {shim}) 2>/dev/null || nix-store -q --requisites {shim}")
+        # The full test package OUTPUT must not be a runtime dependency of the shim.
+        assert "${testPkgOutPath}" not in refs, \
+            f"LEAK: the shim's closure contains the realised package ${testPkgOutPath}:\n{refs}"
+        # But the .drv (or its inputs) MUST be present so it can be realised offline.
+        drv_present = machine.succeed(f"nix-store -q --requisites {shim} | grep -c '\\.drv$' || true").strip()
+        assert int(drv_present) >= 1, "expected the package .drv in the shim closure"
+
+    # =========================================================
     # Test 2: Slow path — nix-stubs exec realizes a new derivation
     # =========================================================
     with subtest("slow path realization"):
