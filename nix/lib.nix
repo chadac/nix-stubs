@@ -10,17 +10,36 @@ let
     name ? null,
   }:
     let
-      # drvPath WITH context — ensures the .drv (and its build inputs) are in the
-      # shim's closure, so the package can be realised on first use. We deliberately
-      # do NOT embed the realised OUT path: writing it into the shim as a literal
-      # /nix/store/… string makes Nix's REFERENCE SCANNER treat the full built
-      # package as a runtime dependency of the shim — pulling it into the closure
-      # and defeating the whole point (the shim would ship the package it's meant to
-      # lazily fetch). unsafeDiscardStringContext drops the BUILD-time context but
-      # NOT the scanner's textual match. Instead the dispatcher resolves the out
-      # path from the .drv at runtime (`nix-store --query --outputs`, which reads the
-      # drv's declared outputs WITHOUT realising them) — see resolve_out_path.
-      drvPath = package.drvPath;
+      # The shim references the .drv so the package can be realised on first use.
+      # We deliberately do NOT embed the realised OUT path: writing it into the shim
+      # as a literal /nix/store/… string makes Nix's REFERENCE SCANNER treat the full
+      # built package as a runtime dependency of the shim — pulling it into the
+      # closure and defeating the whole point (the shim would ship the package it's
+      # meant to lazily fetch). The dispatcher instead resolves the out path from the
+      # .drv at runtime (`nix-store --query --outputs`, which reads the drv's declared
+      # outputs WITHOUT realising them) — see resolve_out_path.
+      #
+      # `package.drvPath` carries context with `allOutputs = true`, which makes the
+      # .drv's ENTIRE build-output closure a dependency of the shim. That's more than
+      # we need (we only need the .drv file itself to query/realise it) and it's
+      # actively harmful downstream: a consumer that layers the shim's closure into an
+      # OCI image via `dockerTools.streamLayeredImage` enumerates every path in that
+      # closure as a layer — INCLUDING build-time output paths that were never
+      # realised (e.g. a bootstrap `musl-1.2.6` referenced by a build tool's
+      # `stdenv-linux.drv`). The tar step then `os.lstat`s the unrealised path and the
+      # whole image build dies with `FileNotFoundError: …-musl-1.2.6`.
+      #
+      # Even `unsafeDiscardOutputDependency` isn't enough: it drops the "all outputs"
+      # dependency, but the .drv FILE stays in the closure, and a .drv file textually
+      # names its (and its build tools') output paths, which Nix's scanner re-adds and
+      # streamLayeredImage then tries to layer. So we embed the .drv path as a pure
+      # string with NO context at all: the .drv is NOT pulled into the shim's closure,
+      # and the dispatcher realises it at runtime (`nix-store --realise <drv>`), which
+      # substitutes the .drv + builds the tool from the configured caches on first use.
+      # This keeps the lazy shim genuinely tiny (no build-closure baked) — the whole
+      # point of a lazy tool — and keeps unrealised toolchain outputs out of any image
+      # that layers the shim.
+      drvPath = unsafeDiscardStringContext package.drvPath;
 
       defaultBin = package.meta.mainProgram or (parseDrvName package.name).name;
       pkgName = if name != null then name else defaultBin;
