@@ -48,6 +48,19 @@ only outputs get a narinfo. So the recipe has to travel with the stub; it cannot
 be fetched on demand. That is the one thing this project gets right that a naive
 shim does not.
 
+It travels **packed into a single output**, not as the `.drv` files themselves.
+Shipping the `.drv` graph puts unrealised build-time outputs in the stub's
+closure, and every image builder walks that closure with
+`exportReferencesGraph`, which requires each path to be locally valid:
+
+```
+error: path '/nix/store/…-autoreconf-hook' is not valid
+```
+
+So `nix-stubs recipe` serialises the graph into one reference-free blob, which
+substitutes like any other output and enumerates as one ordinary path. The stub
+names its `.drv` as plain text and imports the blob on first use.
+
 Cost is per-**ecosystem**, not per-tool. ~764 of those paths are the stdenv
 bootstrap chain shared by every derivation (`hello`, the most trivial package
 that exists, carries 767). Adding tools to a store that already has one:
@@ -175,7 +188,12 @@ failure (a small CI runner, a resource-capped container).
 
 ```bash
 # --output selects a multi-output package's output BY NAME (awscli2 has out + dist)
-nix-stubs exec --drv-path /nix/store/xxx.drv --output out --bin rg ripgrep -- --version
+# --recipe is the packed build graph, imported if the .drv is not in the store
+nix-stubs exec --drv-path /nix/store/xxx.drv --recipe /nix/store/yyy-recipe-ripgrep \
+  --output out --bin rg ripgrep -- --version
+
+# pack a .drv's build graph (what nix/recipe.nix builds); --list prints it instead
+nix-stubs recipe --out ./recipe.blob /nix/store/xxx.drv
 
 nix-stubs gen --flake . --attr stubs
 nix-stubs check --fast
@@ -188,6 +206,8 @@ nix-stubs check --fast
 
 ```bash
 nix build .#checks.x86_64-linux.lock -L          # eval-level: sync, passthru, context
+nix build .#checks.x86_64-linux.closure -L       # a stub's closure has no .drv in it
 nix build .#checks.x86_64-linux.integration -L   # NixOS VM: exec, closure, realisation
+nix build .#checks.x86_64-linux.overlay -L       # NixOS VM: the overlay, from this repo's lock
 nix run .#check -- --fast                        # this repo's own lock
 ```

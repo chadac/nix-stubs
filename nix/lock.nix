@@ -127,9 +127,19 @@ in
         let
           d = declFor name;
           real = d.package;
+          # The lock wins over the declaration: it is where `--discover-bins`
+          # results are recorded, and `check` keeps the two from disagreeing.
+          #
+          # Spelled out rather than chained with `or`: that operator is attribute
+          # selection with a default, so an attribute that exists and is null
+          # wins over the fallback instead of deferring to it.
+          output =
+            if entry ? output then entry.output
+            else if d.output != null then d.output
+            else real.outputName or "out";
         in
         lib.nameValuePair (entry.attr or d.attr) (mkStub {
-          inherit name;
+          inherit name output;
           # Carried over so the stub still looks like the package it replaces to
           # everything else in the set — nixpkgs' uv-build reads pkgs.uv.meta.license,
           # and a stub with invented meta breaks that package's eval outright.
@@ -141,20 +151,10 @@ in
           # edge and keeps the .drv — and its own input closure — as a real
           # dependency, so the recipe travels with the stub.
           drv = builtins.unsafeDiscardOutputDependency real.drvPath;
-          # The lock wins over the declaration: it is where `--discover-bins`
-          # results are recorded, and `check` keeps the two from disagreeing.
-          #
-          # Spelled out rather than chained with `or`: that operator is attribute
-          # selection with a default, so an attribute that exists and is null
-          # wins over the fallback instead of deferring to it.
           bins =
             if entry ? bins then entry.bins
             else if d.bins != null then d.bins
             else [ (defaultBin real) ];
-          output =
-            if entry ? output then entry.output
-            else if d.output != null then d.output
-            else real.outputName or "out";
           passthru = {
             # nixpkgs routes every buildInputs/nativeBuildInputs element through
             # getDev (lib/attrsets.nix), which prefers `.dev`. Pointing it at the

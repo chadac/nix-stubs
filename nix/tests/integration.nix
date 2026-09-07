@@ -80,21 +80,41 @@ in pkgs.testers.nixosTest {
         result = machine.succeed("lazy-test-tool")
         assert "lazy-test-output-success" in result, f"unexpected output: {result}"
 
-    # THE guarantee, in both directions. The stub must carry the package's
-    # RECIPE (no cache serves .drv paths, so nothing else can recover it) and
-    # must NOT carry the package's OUTPUT (awscli2: 8.4 MB against 449 MB).
-    # Both directions have been broken in this repo at different times.
-    with subtest("stub closure carries the recipe and excludes the package"):
+    # THE guarantee, in three directions. The stub must carry the package's
+    # RECIPE (no cache serves .drv paths, so nothing else can recover it), must
+    # NOT carry the package's OUTPUT (awscli2: 8.4 MB against 449 MB), and must
+    # carry the recipe as a BLOB rather than as .drv files — a .drv in the
+    # closure breaks every image builder that enumerates it (nix/tests/closure.nix).
+    # All three have been broken in this repo at different times.
+    with subtest("stub closure carries the recipe as a blob, and not the package"):
         stub = machine.succeed("readlink -f $(which lazy-test-tool)").strip()
-        closure = machine.succeed(f"nix-store -q --requisites {stub}")
+        closure = machine.succeed(f"nix-store -q --requisites {stub}").split()
 
         assert "${testPkgOutPath}" not in closure, \
             "LEAK: the stub closure contains the realised package ${testPkgOutPath}"
-        assert "${testPkgDrvPath}" in closure, \
-            "MISSING RECIPE: ${testPkgDrvPath} is not in the stub closure, so the tool could never be realised"
 
-        # The recipe is only useful if its own inputs travelled with it.
-        machine.succeed("nix-store -q --requisites ${testPkgDrvPath} >/dev/null")
+        drvs = [p for p in closure if p.endswith(".drv")]
+        assert not drvs, f"the stub closure ships store derivations: {drvs}"
+
+        assert any("-recipe-lazy-test-tool" in p for p in closure), \
+            f"MISSING RECIPE: no recipe blob in the stub closure, so the tool could never be realised:\n{closure}"
+
+    # Running the tool above imported the blob, so the .drv is in the store now
+    # and nix can be asked what it really depends on. The packer works out that
+    # graph by parsing ATerm itself (a build sandbox has no daemon to ask), so
+    # this is where that parser is checked against nix's own answer — a packer
+    # that under-collects ships a recipe that cannot be realised.
+    with subtest("the packed recipe is exactly the .drv's closure"):
+        machine.succeed("test -e ${testPkgDrvPath}")
+        mine = set(machine.succeed(
+            "nix-stubs recipe --list ${testPkgDrvPath}").split())
+        truth = set(machine.succeed(
+            "nix-store -q --requisites ${testPkgDrvPath}").split())
+        assert mine == truth, (
+            f"the packer disagrees with nix-store --requisites\n"
+            f"  missing: {sorted(truth - mine)}\n"
+            f"  extra:   {sorted(mine - truth)}"
+        )
 
     with subtest("multi-output packages are selected by NAME, not position"):
         result = machine.succeed("multi-tool")

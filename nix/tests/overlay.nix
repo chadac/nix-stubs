@@ -26,7 +26,6 @@ let
   # which is the same lesson this project is built on.
   realHello = pkgs.hello;
   realHelloOut = builtins.unsafeDiscardStringContext (toString pkgs.hello);
-  helloRecipe = builtins.unsafeDiscardStringContext pkgs.hello.drvPath;
 in
 pkgs.testers.runNixOSTest {
   name = "nix-stubs-overlay";
@@ -70,13 +69,19 @@ pkgs.testers.runNixOSTest {
         machine.succeed("command -v ttyd")
 
     with subtest("the closure carries recipes, not packages"):
-        closure = machine.succeed("nix-store -q --requisites /run/current-system")
-        assert "${helloRecipe}" in closure, \
-            "MISSING RECIPE: hello's .drv is absent, so it could never be realised"
+        closure = machine.succeed("nix-store -q --requisites /run/current-system").split()
+
+        assert any("-recipe-hello" in p for p in closure), \
+            "MISSING RECIPE: no recipe blob for hello, so it could never be realised"
         # The package is present in the VM store (seeded, so the shim can exec it)
         # but must NOT be part of the system — that is the whole point.
         assert "${realHelloOut}" not in closure, \
             "LEAK: hello's built output is in the system closure"
+        # And the recipe travels as that blob, never as store derivations: a .drv
+        # in a system closure breaks every image builder that enumerates it
+        # (nix/tests/closure.nix).
+        drvs = [p for p in closure if p.endswith(".drv")]
+        assert not drvs, f"the system closure ships store derivations: {drvs}"
 
     with subtest("a stub execs the real tool"):
         out = machine.succeed("hello")

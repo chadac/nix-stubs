@@ -1,5 +1,6 @@
 mod gen;
 mod lock;
+mod recipe;
 
 use clap::{Parser, Subcommand};
 use gen::GenOpts;
@@ -34,12 +35,30 @@ enum Commands {
         #[arg(long)]
         bin: Option<String>,
 
+        /// Recipe blob to import when the .drv is not in the store
+        #[arg(long)]
+        recipe: Option<String>,
+
         /// Tool name
         tool: String,
 
         /// Arguments to pass to the tool
         #[arg(last = true)]
         args: Vec<String>,
+    },
+
+    /// Pack a .drv's build graph into a recipe blob (a nix-store export stream)
+    Recipe {
+        /// Where to write the blob
+        #[arg(long)]
+        out: Option<String>,
+
+        /// Print the closure in packing order instead of writing a blob
+        #[arg(long)]
+        list: bool,
+
+        /// Root .drv paths to pack
+        roots: Vec<String>,
     },
 
     /// Generate stubs.lock from a flake's stub set
@@ -110,9 +129,9 @@ fn resolve_out_path(drv_path: &str, output: &str) -> Result<String, String> {
         if stderr.contains("no substituter") || stderr.contains("is not valid") {
             return Err(format!(
                 "the recipe for this tool is missing from the store:\n  {drv_path}\n\
-                 Binary caches do not serve .drv paths, so it cannot be fetched. The stub was \
-                 built without its recipe as a dependency — rebuild it with a nix-stubs that \
-                 keeps the .drv in the stub's closure."
+                 Binary caches do not serve .drv paths, so it cannot be fetched — it comes \
+                 from the stub's recipe blob. The stub was built without one, or the import \
+                 failed; rebuild it with a nix-stubs that passes --recipe."
             ));
         }
         return Err(format!(
@@ -128,7 +147,49 @@ fn resolve_out_path(drv_path: &str, output: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn realize(drv_path: &str, tool: &str) -> Result<(), String> {
+/// Put the recipe back in the store.
+///
+/// The blob is an ordinary derivation output — that is the whole point, since a
+/// .drv shipped as itself breaks closure enumeration and no cache serves one —
+/// so the .drv only becomes a real store path here, on first use.
+fn import_recipe(blob: &str, tool: &str) -> Result<(), String> {
+    let file = std::fs::File::open(blob)
+        .map_err(|e| format!("the recipe blob for {tool} is missing:\n  {blob}\n  {e}"))?;
+
+    let result = Command::new("nix-store")
+        .arg("--import")
+        .stdin(file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run nix-store --import: {e}"))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        // The blob is unsigned: nothing signs a path that is generated inside a
+        // build sandbox. Untrusted users cannot import one, and the generic
+        // "cannot add path" is not a useful thing to hand a user.
+        if stderr.contains("lacks a signature") || stderr.contains("untrusted") {
+            return Err(format!(
+                "cannot import the recipe for '{tool}': this user is not a trusted \
+                 nix user, and a recipe blob carries no signature.\n\
+                 Add yourself to `trusted-users` in nix.conf, or realise the tool \
+                 as root once."
+            ));
+        }
+        return Err(format!(
+            "nix-store --import failed for {tool}: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// A stub that still has work to do needs the daemon, which a build sandbox does
+/// not have. Checked before the import as well as before the realise: with the
+/// recipe now shipped as a blob, importing it is the first thing that would fail,
+/// and it fails as an opaque "cannot add path" instead of naming the escape hatch.
+fn refuse_in_build_sandbox(tool: &str) -> Result<(), String> {
     if std::env::var_os("NIX_BUILD_TOP").is_some() {
         return Err(format!(
             "'{tool}' is a lazy stub and cannot be realised inside a build sandbox.\n\
@@ -136,20 +197,38 @@ fn realize(drv_path: &str, tool: &str) -> Result<(), String> {
              get it via getDev)."
         ));
     }
+    Ok(())
+}
 
-    // Substitute-first. `--max-jobs 0` refuses to build anything locally, so a
-    // cache hit is silent and a cache MISS is where the user finds out they are
-    // about to compile — rather than a stub appearing to hang for 40 minutes.
+fn realize(drv_path: &str, out_path: &str, tool: &str) -> Result<(), String> {
+    refuse_in_build_sandbox(tool)?;
+
+    // Substitute-first, and against the OUTPUT PATH rather than the .drv: a
+    // cache hit is silent, and a MISS is where the user finds out they are about
+    // to compile rather than a stub appearing to hang for 40 minutes.
+    //
+    // Asking for the path is also the only form that is safe here. Handing
+    // nix-store a freshly imported .drv makes it plan a derivation goal, and
+    // nix 2.34 ABORTS on an assertion inside Goal::work() when it does — a
+    // crash, not a cache miss, so the stub fell through to building stdenv from
+    // source. A path goal cannot build anything, so `--max-jobs 0` is implied.
     eprintln!("nix-stubs: fetching {tool}...");
     let substituted = Command::new("nix-store")
-        .args(["--realise", "--max-jobs", "0", drv_path])
+        .args(["--realise", out_path])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .map_err(|e| format!("failed to run nix-store: {e}"))?;
 
-    if substituted.success() {
+    if substituted.status.success() {
         return Ok(());
+    }
+
+    // Why it missed, not just that it did: "no substituter" and "signature"
+    // and "not allowed to build" are three different problems for the user, and
+    // the next line commits them to a build that can take 40 minutes.
+    let why = String::from_utf8_lossy(&substituted.stderr);
+    for line in why.lines().filter(|l| !l.trim().is_empty()).take(3) {
+        eprintln!("nix-stubs: {}", line.trim());
     }
 
     if std::env::var_os("NIX_STUBS_NO_BUILD").is_some() {
@@ -179,24 +258,64 @@ fn cmd_exec(
     output: String,
     out_path: Option<String>,
     bin: Option<String>,
+    recipe: Option<String>,
     tool: String,
     args: Vec<String>,
 ) {
+    let die = |e: String| -> ! {
+        eprintln!("nix-stubs: {e}");
+        std::process::exit(1)
+    };
+
+    // The .drv is absent until something imports the blob — a stub ships the
+    // recipe as an opaque output, not as store derivations.
+    //
+    // Driven by nix REJECTING the .drv, not by the file being absent: a store
+    // image can carry the .drv file without registering it as valid (a NixOS VM
+    // does exactly this), and then an existence check skips the import and every
+    // later nix call fails with "path … is not valid".
+    let import_once = std::cell::Cell::new(false);
+    let ensure_recipe = || {
+        if import_once.replace(true) {
+            return false;
+        }
+        match &recipe {
+            None => false,
+            Some(blob) => {
+                if let Err(e) =
+                    refuse_in_build_sandbox(&tool).and_then(|_| import_recipe(blob, &tool))
+                {
+                    die(e);
+                }
+                true
+            }
+        }
+    };
+
     let out_path = match out_path {
+        // An out-path in the shim means the common case (the tool is already
+        // realised) costs no nix-store call and no import at all.
         Some(p) => p,
         None => match resolve_out_path(&drv_path, &output) {
             Ok(p) => p,
+            // The recipe is the only way that lookup can start working, so retry
+            // exactly once behind it rather than reporting the first failure.
             Err(e) => {
-                eprintln!("nix-stubs: {e}");
-                std::process::exit(1);
+                if !ensure_recipe() {
+                    die(e);
+                }
+                match resolve_out_path(&drv_path, &output) {
+                    Ok(p) => p,
+                    Err(e) => die(e),
+                }
             }
         },
     };
 
     if !Path::new(&out_path).exists() {
-        if let Err(e) = realize(&drv_path, &tool) {
-            eprintln!("nix-stubs: {e}");
-            std::process::exit(1);
+        ensure_recipe();
+        if let Err(e) = realize(&drv_path, &out_path, &tool) {
+            die(e);
         }
     }
 
@@ -252,9 +371,11 @@ fn main() {
             output,
             out_path,
             bin,
+            recipe,
             tool,
             args,
-        } => cmd_exec(drv_path, output, out_path, bin, tool, args),
+        } => cmd_exec(drv_path, output, out_path, bin, recipe, tool, args),
+        Commands::Recipe { out, list, roots } => recipe::cmd_export(roots, out, list),
         Commands::Gen {
             flake,
             attr,

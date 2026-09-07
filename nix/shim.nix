@@ -11,10 +11,13 @@ in
 # stubs.lock) — so a stub is identical whichever way it was declared. They
 # differ only in how `drv` acquired its string context; see nix/lock.nix.
 #
-#   drv     string naming the .drv, WITH context, so Nix's reference scanner
-#           makes the recipe a dependency of the stub. A context-free string
-#           would produce a stub naming a .drv that was never copied anywhere.
-#   output  which output to exec from, BY NAME (awscli2 has out + dist).
+#   drv     string naming the .drv, WITH context — the recipe derivation needs
+#           it as a real input to pack it. The shim itself names it context-free;
+#           what travels with the stub is the packed blob (nix/recipe.nix).
+#   output  which output to exec from, BY NAME (awscli2 has out + dist). Resolved
+#           at RUN time, not baked in: naming the out path here would put it in
+#           the shim's text, and the reference scanner would then pull the whole
+#           package into the stub's closure (nix/tests/lock.nix guards this).
 #   meta/pname/version
 #           carried over from the real package. A stub stands in for it inside a
 #           package set, and other packages read those attributes: nixpkgs'
@@ -24,9 +27,17 @@ in
 { name, drv, output ? "out", bins, passthru ? { }, meta ? { }, pname ? null, version ? null }:
 
 let
+  recipe = import ./recipe.nix { inherit pkgs nix-stubs; } { inherit name drv; };
+
+  # Context-FREE: the shim names the .drv but must not depend on it, or the
+  # closure carries a .drv graph again and enumeration breaks. The recipe blob
+  # is the dependency that makes the path recoverable at first use.
+  drvPath = builtins.unsafeDiscardStringContext drv;
+
   mkShim = bin: writeShellScriptBin bin ''
     exec ${nix-stubs}/bin/nix-stubs exec \
-      --drv-path "${drv}" \
+      --drv-path "${drvPath}" \
+      --recipe "${recipe}" \
       --output "${output}" \
       --bin "${bin}" \
       "${name}" \
