@@ -39,17 +39,20 @@ let
 
   # A derivation the VM can build with no stdenv, for the realisation path.
   # Instantiated inside the VM so its output genuinely does not exist yet.
+  #
+  # Builds in the normal sandbox with store-path tools. An earlier version used
+  # `__noChroot` with /bin/sh and PATH pointing at the host system; its builder
+  # was killed by signal 9 on a GitHub runner (not OOM — no kill event in the
+  # journal), which is the kind of thing sandbox escape hatches invite.
   dynamicTestNix = pkgs.writeText "dynamic-test.nix" ''
     derivation {
       name = "dynamic-test-tool";
-      builder = "/bin/sh";
+      system = builtins.currentSystem;
+      builder = "${pkgs.bash}/bin/bash";
       args = [
         "-c"
-        "mkdir -p $out/bin && printf '#!/bin/sh\necho dynamic-test-success\n' > $out/bin/dynamic-test-tool && chmod +x $out/bin/dynamic-test-tool"
+        "${pkgs.coreutils}/bin/mkdir -p $out/bin && printf '#!/bin/sh\necho dynamic-test-success\n' > $out/bin/dynamic-test-tool && ${pkgs.coreutils}/bin/chmod +x $out/bin/dynamic-test-tool"
       ];
-      system = builtins.currentSystem;
-      __noChroot = true;
-      PATH = "/run/current-system/sw/bin:/usr/bin:/bin";
     }
   '';
 
@@ -63,7 +66,7 @@ in pkgs.testers.nixosTest {
     # supplied separately so exec can be tested without a from-source build in
     # the VM; the closure assertions below prove they did NOT arrive via the
     # stubs.
-    virtualisation.additionalPaths = [ testPkg multiPkg multiPkg.dist ];
+    virtualisation.additionalPaths = [ testPkg multiPkg multiPkg.dist pkgs.bash pkgs.coreutils ];
 
     environment.systemPackages = [ nix-stubs testStub multiStub ];
 
@@ -71,8 +74,6 @@ in pkgs.testers.nixosTest {
       experimental-features = [ "nix-command" ];
       # No cache.nixos.org DNS lookups in the VM.
       substituters = lib.mkForce [ ];
-      # For the __noChroot dynamic derivation.
-      sandbox = "relaxed";
     };
 
     environment.etc."dynamic-test.nix".source = dynamicTestNix;
