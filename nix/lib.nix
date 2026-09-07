@@ -26,7 +26,7 @@ let
       # context, which would pull the outputs in; discarding the OUTPUT
       # dependency drops that edge and keeps the .drv itself.
       #
-      # Discarding the whole string context instead (as this did until #1) leaves
+      # Discarding the whole string context instead (as this did until #3) leaves
       # a stub naming a .drv that was never copied anywhere, and caches do not
       # serve .drv paths — so every invocation fails with "no substituter that
       # can build it".
