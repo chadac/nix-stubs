@@ -37,55 +37,39 @@ let
   testPkgOutPath = builtins.unsafeDiscardStringContext (toString testPkg);
   testPkgDrvPath = builtins.unsafeDiscardStringContext testPkg.drvPath;
 
-  # A derivation the VM can build with no stdenv, for the realisation path.
-  # Instantiated inside the VM so its output genuinely does not exist yet.
-  #
-  # Builds in the normal sandbox with store-path tools. An earlier version used
-  # `__noChroot` with /bin/sh and PATH pointing at the host system; its builder
-  # was killed by signal 9 on a GitHub runner (not OOM — no kill event in the
-  # journal), which is the kind of thing sandbox escape hatches invite.
-  # storePath, not a bare path string: a context-free store path is not an input
-  # of the derivation, so the sandbox never binds it and the builder fails with
-  # a misleading "No such file or directory" for a path that plainly exists.
-  dynamicTestNix = pkgs.writeText "dynamic-test.nix" ''
-    let
-      bash = builtins.storePath "${pkgs.bash}";
-      coreutils = builtins.storePath "${pkgs.coreutils}";
-    in
-    derivation {
-      name = "dynamic-test-tool";
-      system = builtins.currentSystem;
-      builder = "''${bash}/bin/bash";
-      args = [
-        "-c"
-        "''${coreutils}/bin/mkdir -p $out/bin && printf '#!/bin/sh\necho dynamic-test-success\n' > $out/bin/dynamic-test-tool && ''${coreutils}/bin/chmod +x $out/bin/dynamic-test-tool"
-      ];
-    }
-  '';
+  # The tool the realisation subtest fetches. It is NOT in systemPackages, so
+  # nothing roots it and the test can delete it from the VM store to create the
+  # "not realised yet" state honestly.
+  fetchedPkg = pkgs.writeShellScriptBin "fetched-tool" ''echo fetched-tool-success'';
+  fetchedStub = mkStub {
+    name = "fetched-tool";
+    drv = recipeOf fetchedPkg;
+    bins = [ "fetched-tool" ];
+  };
+  fetchedOut = builtins.unsafeDiscardStringContext (toString fetchedPkg);
 
 in pkgs.testers.nixosTest {
   name = "nix-stubs-integration";
 
   nodes.machine = { config, pkgs, ... }: {
-    # 4 GiB: the realisation subtest builds a derivation in-VM, and at 2 GiB its
-    # builder was intermittently killed by signal 9 on GitHub runners.
-    virtualisation.memorySize = 4096;
+    virtualisation.memorySize = 2048;
 
     # The stubs' own closures carry recipes, not packages. These outputs are
     # supplied separately so exec can be tested without a from-source build in
     # the VM; the closure assertions below prove they did NOT arrive via the
     # stubs.
-    virtualisation.additionalPaths = [ testPkg multiPkg multiPkg.dist pkgs.bash pkgs.coreutils ];
+    virtualisation.additionalPaths = [ testPkg multiPkg multiPkg.dist fetchedPkg ];
 
-    environment.systemPackages = [ nix-stubs testStub multiStub ];
+    environment.systemPackages = [ nix-stubs testStub multiStub fetchedStub ];
 
     nix.settings = {
       experimental-features = [ "nix-command" ];
-      # No cache.nixos.org DNS lookups in the VM.
-      substituters = lib.mkForce [ ];
+      # The ONLY substituter is a local directory the test fills at runtime. No
+      # cache.nixos.org DNS lookups, and realisation is exercised for real: the
+      # tool is deleted from the store and has to come back from here.
+      substituters = lib.mkForce [ "file:///var/cache/test-substituter" ];
+      require-sigs = false;
     };
-
-    environment.etc."dynamic-test.nix".source = dynamicTestNix;
   };
 
   testScript = ''
@@ -119,33 +103,34 @@ in pkgs.testers.nixosTest {
         assert "WRONG-OUTPUT" not in result, \
             "the dispatcher took an output by position; awscli2 has out + dist and would break"
 
-    # Ordered before the realisation subtest on purpose: this needs an output
-    # that genuinely does not exist yet, and deleting one afterwards is not
-    # reliable (it may be a GC root, and a failed delete would silently turn
-    # this into a no-op that passes).
-    #
+    # Both remaining subtests need a tool that is genuinely NOT realised. The VM
+    # gets there by publishing the tool to a local binary cache and then deleting
+    # it from the store — rather than by BUILDING one in-VM, which is unreliable
+    # on GitHub runners: a trivial builder was killed by signal 9 there, both
+    # sandboxed and under __noChroot, at 2 GiB and at 4 GiB. Substituting is also
+    # the path production actually takes.
+    with subtest("publish the tool to a local substituter, then remove it"):
+        machine.succeed(
+            "nix --extra-experimental-features nix-command copy "
+            "--to file:///var/cache/test-substituter ${fetchedOut}"
+        )
+        # Nothing roots it: fetched-tool is not in systemPackages, only its stub is.
+        machine.succeed("nix-store --delete ${fetchedOut}")
+        machine.succeed("test ! -e ${fetchedOut}")
+
     # A stub on a build input can't work — a build sandbox has no daemon socket.
     # It must say so, naming the escape hatch, rather than emitting an opaque
-    # nix-store error.
+    # nix-store error. Ordered before the realisation subtest so it runs while
+    # the tool is still absent.
     with subtest("a stub refuses to realise inside a build sandbox"):
-        drv = machine.succeed("nix-instantiate /etc/dynamic-test.nix").strip()
-        out = machine.succeed(f"nix-store -q --binding out {drv}").strip()
-        machine.succeed(f"test ! -e {out}")
-
-        err = machine.fail(
-            f"NIX_BUILD_TOP=/build nix-stubs exec --drv-path {drv} dynamic-test-tool 2>&1"
-        )
+        err = machine.fail("NIX_BUILD_TOP=/build fetched-tool 2>&1")
         assert "build sandbox" in err, f"expected a build-sandbox diagnostic, got: {err}"
         assert ".real" in err, f"the error should name the escape hatch, got: {err}"
-        machine.succeed(f"test ! -e {out}")
+        machine.succeed("test ! -e ${fetchedOut}")
 
-    with subtest("first use realises a package that is not in the store"):
-        drv = machine.succeed("nix-instantiate /etc/dynamic-test.nix").strip()
-        out = machine.succeed(f"nix-store -q --binding out {drv}").strip()
-        machine.succeed(f"test ! -e {out}")
-
-        result = machine.succeed(f"nix-stubs exec --drv-path {drv} dynamic-test-tool")
-        assert "dynamic-test-success" in result, f"unexpected output: {result}"
-        machine.succeed(f"test -e {out}")
+    with subtest("first use realises a tool that is not in the store"):
+        result = machine.succeed("fetched-tool")
+        assert "fetched-tool-success" in result, f"unexpected output: {result}"
+        machine.succeed("test -e ${fetchedOut}")
   '';
 }
