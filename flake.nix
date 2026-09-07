@@ -82,7 +82,6 @@
         };
 
         # Enumerating a stub's closure, the way every image builder does.
-        # RED: see nix/tests/closure.nix.
         closure = import ./nix/tests/closure.nix {
           inherit pkgs lockLib;
           nix-stubs = self.packages.${system}.nix-stubs;
