@@ -63,3 +63,9 @@ jobs:
 
       - name: integration test
         run: nix build .#checks.x86_64-linux.integration -L
+
+      # The overlay end-to-end: stubs.nix -> lock -> systemPackages -> a tool that
+      # runs. Catches what the mechanism-level test cannot, e.g. a stub inheriting
+      # meta.outputsToInstall it cannot satisfy.
+      - name: overlay test
+        run: nix build .#checks.x86_64-linux.overlay -L

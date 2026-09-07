@@ -38,6 +38,15 @@
           "tree"
         ],
         "name": "tree-2.3.2"
+      },
+      "ttyd": {
+        "attr": "ttyd",
+        "drv": "/nix/store/xq9s5rkx2anahn9v7acxyz56wxcb42wz-ttyd-1.7.7.drv",
+        "output": "out",
+        "bins": [
+          "ttyd"
+        ],
+        "name": "ttyd-1.7.7"
       }
     }
   }

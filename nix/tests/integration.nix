@@ -67,7 +67,9 @@ in pkgs.testers.nixosTest {
   name = "nix-stubs-integration";
 
   nodes.machine = { config, pkgs, ... }: {
-    virtualisation.memorySize = 2048;
+    # 4 GiB: the realisation subtest builds a derivation in-VM, and at 2 GiB its
+    # builder was intermittently killed by signal 9 on GitHub runners.
+    virtualisation.memorySize = 4096;
 
     # The stubs' own closures carry recipes, not packages. These outputs are
     # supplied separately so exec can be tested without a from-source build in

@@ -19,4 +19,11 @@
   hello = pkgs.hello;
   tree = pkgs.tree;
   ripgrep = { package = pkgs.ripgrep; bins = [ "rg" ]; };
+
+  # MULTI-OUTPUT on purpose (out + man). A stub inherits the real package's meta
+  # so other packages can read it, and `meta.outputsToInstall` then names outputs
+  # the stub does not have — which made environment.systemPackages fail with
+  # "attribute 'man' missing" inside buildEnv. checks.overlay puts this on PATH in
+  # a booted system, so that regression cannot come back quietly.
+  ttyd = { package = pkgs.ttyd; output = "out"; };
 }
