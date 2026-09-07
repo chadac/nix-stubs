@@ -38,6 +38,12 @@ jobs:
       - name: eval-level lock checks
         run: nix build .#checks.x86_64-linux.lock -L
 
+      # RED until stubs stop shipping .drv files in their closure. Enumerating a
+      # stub's closure is what every image builder does, so this failing here is
+      # the point — it took down scooter's image build before this repo noticed.
+      - name: closure enumeration
+        run: nix build .#checks.x86_64-linux.closure -L
+
       - name: rustfmt
         run: nix develop -c cargo fmt --check
 

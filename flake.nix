@@ -81,6 +81,16 @@
           flakeLock = ./flake.lock;
         };
 
+        # Enumerating a stub's closure, the way every image builder does.
+        # RED: see nix/tests/closure.nix.
+        closure = import ./nix/tests/closure.nix {
+          inherit pkgs lockLib;
+          nix-stubs = self.packages.${system}.nix-stubs;
+          stubsNix = ./stubs.nix;
+          stubsLock = ./stubs.lock;
+          flakeLock = ./flake.lock;
+        };
+
         # The overlay end-to-end in a booted system, against this repo's own
         # stubs.nix/stubs.lock.
         overlay = import ./nix/tests/overlay.nix {
