@@ -3,9 +3,6 @@ mod lock;
 
 use clap::{Parser, Subcommand};
 use gen::GenOpts;
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -94,48 +91,6 @@ enum Commands {
         #[arg(long)]
         fast: bool,
     },
-
-    /// Output shell activation hooks
-    Activate {
-        /// Shell type
-        shell: Shell,
-
-        /// Path to manifest JSON
-        #[arg(long)]
-        manifest: String,
-
-        /// Path to shim directory
-        #[arg(long)]
-        shim_dir: String,
-    },
-
-    /// Check realized status and output PATH updates (called by shell hook)
-    HookEnv {
-        /// Path to manifest JSON
-        #[arg(long)]
-        manifest: String,
-    },
-}
-
-#[derive(Clone, clap::ValueEnum)]
-enum Shell {
-    Bash,
-    Zsh,
-    Fish,
-}
-
-#[derive(Deserialize)]
-struct Manifest {
-    tools: HashMap<String, ToolEntry>,
-}
-
-#[derive(Deserialize)]
-struct ToolEntry {
-    #[allow(dead_code)]
-    drv_path: String,
-    out_path: String,
-    #[allow(dead_code)]
-    commands: Vec<String>,
 }
 
 /// Resolve an output BY NAME without realising anything.
@@ -288,94 +243,6 @@ fn gen_opts(
     }
 }
 
-fn cmd_activate(shell: Shell, manifest: String, shim_dir: String) {
-    match shell {
-        Shell::Bash => {
-            println!(
-                r#"# nix-stubs shell activation (bash)
-export PATH="${{PATH}}:{shim_dir}"
-__nix_stubs_hook() {{
-  local new_path
-  new_path="$(nix-stubs hook-env --manifest "{manifest}" 2>/dev/null)"
-  if [ -n "$new_path" ]; then
-    export PATH="$new_path"
-  fi
-}}
-if [[ ! "${{PROMPT_COMMAND:-}}" =~ __nix_stubs_hook ]]; then
-  PROMPT_COMMAND="__nix_stubs_hook${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}"
-fi"#
-            );
-        }
-        Shell::Zsh => {
-            println!(
-                r#"# nix-stubs shell activation (zsh)
-export PATH="${{PATH}}:{shim_dir}"
-__nix_stubs_hook() {{
-  local new_path
-  new_path="$(nix-stubs hook-env --manifest "{manifest}" 2>/dev/null)"
-  if [[ -n "$new_path" ]]; then
-    export PATH="$new_path"
-  fi
-}}
-if (( ! ${{precmd_functions[(I)__nix_stubs_hook]}} )); then
-  precmd_functions+=(__nix_stubs_hook)
-fi"#
-            );
-        }
-        Shell::Fish => {
-            println!(
-                r#"# nix-stubs shell activation (fish)
-set -gx PATH $PATH "{shim_dir}"
-function __nix_stubs_hook --on-event fish_prompt
-  set -l new_path (nix-stubs hook-env --manifest "{manifest}" 2>/dev/null)
-  if test -n "$new_path"
-    set -gx PATH (string split ":" -- $new_path)
-  end
-end"#
-            );
-        }
-    }
-}
-
-fn cmd_hook_env(manifest: String) {
-    let manifest_contents = match fs::read_to_string(&manifest) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("nix-stubs: failed to read manifest {manifest}: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let manifest: Manifest = match serde_json::from_str(&manifest_contents) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("nix-stubs: failed to parse manifest: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let current_entries: Vec<&str> = current_path.split(':').collect();
-
-    // Collect bin dirs for realized packages
-    let mut realized_dirs: Vec<String> = Vec::new();
-    for entry in manifest.tools.values() {
-        let bin_dir = format!("{}/bin", entry.out_path);
-        if Path::new(&bin_dir).exists() && !current_entries.contains(&bin_dir.as_str()) {
-            realized_dirs.push(bin_dir);
-        }
-    }
-
-    if realized_dirs.is_empty() {
-        // No changes needed — output nothing
-        return;
-    }
-
-    // Prepend realized dirs to PATH (before existing entries)
-    realized_dirs.extend(current_entries.iter().map(|s| s.to_string()));
-    println!("{}", realized_dirs.join(":"));
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -415,11 +282,5 @@ fn main() {
             gen_opts(flake, attr, vec![], lock, flake_lock, vec![], false),
             fast,
         ),
-        Commands::Activate {
-            shell,
-            manifest,
-            shim_dir,
-        } => cmd_activate(shell, manifest, shim_dir),
-        Commands::HookEnv { manifest } => cmd_hook_env(manifest),
     }
 }

@@ -72,7 +72,10 @@ impl Lock {
 ///
 /// Recorded verbatim so the sync check is an exact comparison: any change to
 /// how that input is pinned trips it, not just a rev bump.
-pub fn locked_input(flake_lock: &serde_json::Value, name: &str) -> Result<serde_json::Value, String> {
+pub fn locked_input(
+    flake_lock: &serde_json::Value,
+    name: &str,
+) -> Result<serde_json::Value, String> {
     let root_name = flake_lock
         .get("root")
         .and_then(|v| v.as_str())

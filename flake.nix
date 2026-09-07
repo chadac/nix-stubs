@@ -75,7 +75,5 @@
           inherit lockLib;
         };
       });
-
-      homeManagerModules.default = import ./nix/module.nix self;
     };
 }

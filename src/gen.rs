@@ -46,8 +46,14 @@ pub struct GenOpts {
 }
 
 fn current_system() -> Result<String, String> {
-    nix(&["eval", "--impure", "--raw", "--expr", "builtins.currentSystem"])
-        .map_err(|e| format!("could not determine the current system (pass --system): {e}"))
+    nix(&[
+        "eval",
+        "--impure",
+        "--raw",
+        "--expr",
+        "builtins.currentSystem",
+    ])
+    .map_err(|e| format!("could not determine the current system (pass --system): {e}"))
 }
 
 fn nix(args: &[&str]) -> Result<String, String> {
@@ -65,7 +71,12 @@ fn nix(args: &[&str]) -> Result<String, String> {
 /// Enumerate `$out/bin` for real. Opt-in: it BUILDS the package, and the point
 /// of a relock is to not build anything.
 fn discover_bins(drv: &str, output: &str) -> Result<Vec<String>, String> {
-    let out_path = nix(&["build", "--no-link", "--print-out-paths", &format!("{drv}^{output}")])?;
+    let out_path = nix(&[
+        "build",
+        "--no-link",
+        "--print-out-paths",
+        &format!("{drv}^{output}"),
+    ])?;
     let bin_dir = format!("{}/bin", out_path.lines().next().unwrap_or_default());
     let mut bins: Vec<String> = std::fs::read_dir(&bin_dir)
         .map_err(|e| format!("{bin_dir}: {e}"))?
@@ -98,7 +109,10 @@ pub fn build_lock(opts: &GenOpts) -> Result<Lock, String> {
         let target = format!("{}#{}.{}", opts.flake, opts.attr, system);
         eprintln!("nix-stubs: evaluating {target}");
         let json = nix(&["eval", "--json", &target, "--apply", EXTRACT]).map_err(|e| {
-            format!("failed to evaluate {target}\n{e}\n\nDoes the flake expose `{}.{system}`?", opts.attr)
+            format!(
+                "failed to evaluate {target}\n{e}\n\nDoes the flake expose `{}.{system}`?",
+                opts.attr
+            )
         })?;
         let raw: BTreeMap<String, Raw> =
             serde_json::from_str(&json).map_err(|e| format!("unexpected eval output: {e}"))?;
@@ -185,7 +199,10 @@ pub fn cmd_check(opts: GenOpts, fast: bool) {
     };
     let errs = lock::sync_errors(&committed, &flake_lock);
     if !errs.is_empty() {
-        eprintln!("nix-stubs: {} is out of sync with flake.lock\n", opts.lock_path);
+        eprintln!(
+            "nix-stubs: {} is out of sync with flake.lock\n",
+            opts.lock_path
+        );
         for e in &errs {
             eprintln!("  {e}\n");
         }
