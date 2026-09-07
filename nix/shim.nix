@@ -37,7 +37,14 @@ symlinkJoin ({
   name = "stub-${name}";
   paths = map mkShim bins;
   inherit passthru;
-  meta = meta // { mainProgram = builtins.head bins; };
+  # `outputsToInstall` is overridden, not inherited: it names the real package's
+  # outputs (ttyd's is [ "out" "man" ]) and a stub has only `out`, so passing it
+  # through makes environment.systemPackages fail with "attribute 'man' missing"
+  # inside buildEnv. mainProgram is likewise the stub's own.
+  meta = meta // {
+    mainProgram = builtins.head bins;
+    outputsToInstall = [ "out" ];
+  };
 }
 // lib.optionalAttrs (pname != null) { inherit pname; }
 // lib.optionalAttrs (version != null) { inherit version; })
