@@ -130,6 +130,12 @@ in
         in
         lib.nameValuePair (entry.attr or d.attr) (mkStub {
           inherit name;
+          # Carried over so the stub still looks like the package it replaces to
+          # everything else in the set — nixpkgs' uv-build reads pkgs.uv.meta.license,
+          # and a stub with invented meta breaks that package's eval outright.
+          meta = real.meta or { };
+          pname = real.pname or null;
+          version = real.version or null;
           # Context matters: `drvPath` carries an allOutputs edge that would drag
           # the built package in. Discarding the OUTPUT dependency drops that
           # edge and keeps the .drv — and its own input closure — as a real
