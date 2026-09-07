@@ -57,6 +57,7 @@ ZSH
   };
 
   testPkgOutPath = builtins.unsafeDiscardStringContext (toString testPkg);
+  testPkgDrvPath = builtins.unsafeDiscardStringContext testPkg.drvPath;
   completionPkgOutPath = builtins.unsafeDiscardStringContext (toString testPkgWithCompletion);
 
   # Nix expression for a dynamic derivation — instantiated at runtime in the VM
@@ -120,22 +121,29 @@ in pkgs.testers.nixosTest {
         assert "lazy-test-output-success" in result, f"Expected output not found: {result}"
 
     # =========================================================
-    # Test 1b: THE lazy guarantee — the shim's closure must NOT contain the
-    # realised package. (Regression: embedding --out-path as a literal store path
-    # in the shim made Nix's reference scanner re-add the full package as a runtime
-    # dep, defeating laziness. The shim carries only the .drv now.)
+    # Test 1b: THE lazy guarantee, in both directions. The shim's closure must
+    # contain the package's RECIPE (so it can be realised with no evaluator, no
+    # nixpkgs, and no cache that serves .drv paths — none do) and must NOT contain
+    # the package's OUTPUT (which is the whole point: awscli2 is 8.4 MB of recipe
+    # against 449 MB of output).
+    #
+    # Both directions have been broken in this repo at different times: embedding
+    # the out path let the reference scanner re-add the full package, and
+    # discarding the drv's string context left a stub naming a .drv that was
+    # never copied anywhere.
     # =========================================================
-    with subtest("shim closure EXCLUDES the realised package"):
+    with subtest("shim closure carries the recipe and excludes the package"):
         shim = machine.succeed("readlink -f $(which lazy-test-tool)").strip()
-        # The shim is a symlink into the lazy-* symlinkJoin; walk to its real store
-        # path and query its runtime references.
-        refs = machine.succeed(f"nix-store -q --references $(nix-store -q --deriver {shim} >/dev/null 2>&1; echo {shim}) 2>/dev/null || nix-store -q --requisites {shim}")
-        # The full test package OUTPUT must not be a runtime dependency of the shim.
-        assert "${testPkgOutPath}" not in refs, \
-            f"LEAK: the shim's closure contains the realised package ${testPkgOutPath}:\n{refs}"
-        # But the .drv (or its inputs) MUST be present so it can be realised offline.
-        drv_present = machine.succeed(f"nix-store -q --requisites {shim} | grep -c '\\.drv$' || true").strip()
-        assert int(drv_present) >= 1, "expected the package .drv in the shim closure"
+        closure = machine.succeed(f"nix-store -q --requisites {shim}")
+
+        assert "${testPkgOutPath}" not in closure, \
+            f"LEAK: the shim's closure contains the realised package ${testPkgOutPath}:\n{closure}"
+
+        assert "${testPkgDrvPath}" in closure, \
+            f"MISSING RECIPE: ${testPkgDrvPath} is not in the shim's closure, so the tool can never be realised:\n{closure}"
+
+        # The recipe is only useful if its own inputs came along with it.
+        machine.succeed("nix-store -q --requisites ${testPkgDrvPath} >/dev/null")
 
     # =========================================================
     # Test 2: Slow path — nix-stubs exec realizes a new derivation

@@ -2,61 +2,38 @@
 
 let
   inherit (builtins) unsafeDiscardStringContext toString parseDrvName;
-  inherit (pkgs) lib writeShellScriptBin symlinkJoin writeText;
+  inherit (pkgs) lib writeText;
 
-  mkLazyPackage = {
-    package,
-    commands ? null,
-    name ? null,
-  }:
+  mkStub = import ./shim.nix { inherit pkgs nix-stubs; };
+  lock = import ./lock.nix { inherit lib; };
+
+  binsOf = pkg: [ (pkg.meta.mainProgram or (parseDrvName pkg.name).name) ];
+
+  mkLazyPackage =
+    { package
+    , commands ? null
+    , name ? null
+    , output ? null
+    }:
     let
-      # The shim references the .drv so the package can be realised on first use.
-      # We deliberately do NOT embed the realised OUT path: writing it into the shim
-      # as a literal /nix/store/… string makes Nix's REFERENCE SCANNER treat the full
-      # built package as a runtime dependency of the shim — pulling it into the
-      # closure and defeating the whole point (the shim would ship the package it's
-      # meant to lazily fetch). The dispatcher instead resolves the out path from the
-      # .drv at runtime (`nix-store --query --outputs`, which reads the drv's declared
-      # outputs WITHOUT realising them) — see resolve_out_path.
-      #
-      # `package.drvPath` carries context with `allOutputs = true`, which makes the
-      # .drv's ENTIRE build-output closure a dependency of the shim. That's more than
-      # we need (we only need the .drv file itself to query/realise it) and it's
-      # actively harmful downstream: a consumer that layers the shim's closure into an
-      # OCI image via `dockerTools.streamLayeredImage` enumerates every path in that
-      # closure as a layer — INCLUDING build-time output paths that were never
-      # realised (e.g. a bootstrap `musl-1.2.6` referenced by a build tool's
-      # `stdenv-linux.drv`). The tar step then `os.lstat`s the unrealised path and the
-      # whole image build dies with `FileNotFoundError: …-musl-1.2.6`.
-      #
-      # Even `unsafeDiscardOutputDependency` isn't enough: it drops the "all outputs"
-      # dependency, but the .drv FILE stays in the closure, and a .drv file textually
-      # names its (and its build tools') output paths, which Nix's scanner re-adds and
-      # streamLayeredImage then tries to layer. So we embed the .drv path as a pure
-      # string with NO context at all: the .drv is NOT pulled into the shim's closure,
-      # and the dispatcher realises it at runtime (`nix-store --realise <drv>`), which
-      # substitutes the .drv + builds the tool from the configured caches on first use.
-      # This keeps the lazy shim genuinely tiny (no build-closure baked) — the whole
-      # point of a lazy tool — and keeps unrealised toolchain outputs out of any image
-      # that layers the shim.
-      drvPath = unsafeDiscardStringContext package.drvPath;
-
-      defaultBin = package.meta.mainProgram or (parseDrvName package.name).name;
-      pkgName = if name != null then name else defaultBin;
-      bins = if commands != null then commands else [ defaultBin ];
-
-      mkShim = bin:
-        writeShellScriptBin bin ''
-          exec ${nix-stubs}/bin/nix-stubs exec \
-            --drv-path "${drvPath}" \
-            --bin "${bin}" \
-            "${pkgName}" \
-            -- "$@"
-        '';
+      pkgName = if name != null then name else builtins.head (binsOf package);
     in
-    symlinkJoin {
-      name = "lazy-${pkgName}";
-      paths = map mkShim bins;
+    mkStub {
+      name = pkgName;
+      # The stub must depend on the .drv so the recipe is copied along with it,
+      # while NOT depending on the build outputs — that 449 MB is exactly what a
+      # lazy stub exists to avoid shipping. `drvPath` carries `allOutputs`
+      # context, which would pull the outputs in; discarding the OUTPUT
+      # dependency drops that edge and keeps the .drv itself.
+      #
+      # Discarding the whole string context instead (as this did until #1) leaves
+      # a stub naming a .drv that was never copied anywhere, and caches do not
+      # serve .drv paths — so every invocation fails with "no substituter that
+      # can build it".
+      drv = builtins.unsafeDiscardOutputDependency package.drvPath;
+      output = if output != null then output else package.outputName or "out";
+      bins = if commands != null then commands else binsOf package;
+      passthru = { dev = package; real = package; };
     };
 
   mkManifest = tools:
@@ -66,35 +43,34 @@ let
           pkg = if lib.isDerivation tool then tool else tool.package;
           commands =
             if lib.isDerivation tool
-            then [ (pkg.meta.mainProgram or (parseDrvName pkg.name).name) ]
-            else tool.commands or [ (pkg.meta.mainProgram or (parseDrvName pkg.name).name) ];
+            then binsOf pkg
+            else tool.commands or (binsOf pkg);
         in {
-          drv_path = pkg.drvPath;
+          drv_path = unsafeDiscardStringContext pkg.drvPath;
+          # The manifest is only ever stat'd, so it takes a context-free string
+          # deliberately: a real reference here would pull the built package into
+          # the manifest's closure.
           out_path = unsafeDiscardStringContext (toString pkg);
           inherit commands;
         };
-
-      manifestData = {
-        tools = lib.mapAttrs mkEntry tools;
-      };
     in
-    writeText "nix-stubs-manifest.json" (builtins.toJSON manifestData);
+    writeText "nix-stubs-manifest.json" (builtins.toJSON { tools = lib.mapAttrs mkEntry tools; });
 
-  # Overlay that replaces packages in nixpkgs with lazy stubs.
-  # tools: attrset mapping nixpkgs attribute names to config.
-  #   { commands = [ "rg" ]; }  — explicit command list
-  #   {}                        — infer commands from meta.mainProgram
+  # Eval-driven overlay: replaces nixpkgs attrs with stubs built from a live
+  # `pkgs`. Prefer the lock-driven `mkOverlay` in nix/lock.nix — it builds the
+  # same stubs without evaluating the packages.
   mkOverlay = tools: final: prev:
     lib.mapAttrs (name: toolCfg:
-      let
-        commands = if toolCfg == {} then null else toolCfg.commands or null;
-      in
       mkLazyPackage {
         package = prev.${name};
-        inherit name commands;
+        inherit name;
+        commands = if toolCfg == { } then null else toolCfg.commands or null;
+        output = if toolCfg == { } then null else toolCfg.output or null;
       }
     ) tools;
 
 in {
-  inherit mkLazyPackage mkManifest mkOverlay;
+  inherit mkLazyPackage mkManifest mkOverlay mkStub;
+  inherit (lock) drvRef;
+  mkLockOverlay = lock.mkOverlay;
 }

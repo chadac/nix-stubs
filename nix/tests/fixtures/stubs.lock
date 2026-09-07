@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "inputs": {
+    "nixpkgs": {
+      "lastModified": 1,
+      "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "owner": "NixOS",
+      "repo": "nixpkgs",
+      "rev": "0000000000000000000000000000000000000000",
+      "type": "github"
+    }
+  },
+  "packages": {}
+}
