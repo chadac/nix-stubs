@@ -44,14 +44,21 @@ let
   # `__noChroot` with /bin/sh and PATH pointing at the host system; its builder
   # was killed by signal 9 on a GitHub runner (not OOM — no kill event in the
   # journal), which is the kind of thing sandbox escape hatches invite.
+  # storePath, not a bare path string: a context-free store path is not an input
+  # of the derivation, so the sandbox never binds it and the builder fails with
+  # a misleading "No such file or directory" for a path that plainly exists.
   dynamicTestNix = pkgs.writeText "dynamic-test.nix" ''
+    let
+      bash = builtins.storePath "${pkgs.bash}";
+      coreutils = builtins.storePath "${pkgs.coreutils}";
+    in
     derivation {
       name = "dynamic-test-tool";
       system = builtins.currentSystem;
-      builder = "${pkgs.bash}/bin/bash";
+      builder = "''${bash}/bin/bash";
       args = [
         "-c"
-        "${pkgs.coreutils}/bin/mkdir -p $out/bin && printf '#!/bin/sh\necho dynamic-test-success\n' > $out/bin/dynamic-test-tool && ${pkgs.coreutils}/bin/chmod +x $out/bin/dynamic-test-tool"
+        "''${coreutils}/bin/mkdir -p $out/bin && printf '#!/bin/sh\necho dynamic-test-success\n' > $out/bin/dynamic-test-tool && ''${coreutils}/bin/chmod +x $out/bin/dynamic-test-tool"
       ];
     }
   '';
