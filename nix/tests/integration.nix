@@ -95,9 +95,9 @@ in pkgs.testers.nixosTest {
         closure = machine.succeed(f"nix-store -q --requisites {stub}")
 
         assert "${testPkgOutPath}" not in closure, \
-            f"LEAK: the stub's closure contains the realised package ${testPkgOutPath}"
+            "LEAK: the stub closure contains the realised package ${testPkgOutPath}"
         assert "${testPkgDrvPath}" in closure, \
-            f"MISSING RECIPE: ${testPkgDrvPath} is not in the stub's closure, so the tool could never be realised"
+            "MISSING RECIPE: ${testPkgDrvPath} is not in the stub closure, so the tool could never be realised"
 
         # The recipe is only useful if its own inputs travelled with it.
         machine.succeed("nix-store -q --requisites ${testPkgDrvPath} >/dev/null")
