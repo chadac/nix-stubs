@@ -45,13 +45,17 @@
       });
 
       lib = {
-        # The lock-driven overlay. System-agnostic: it picks the entries for
-        # whatever pkgs it is applied to.
+        # The stub overlay. System-agnostic: it picks the entries for whatever
+        # pkgs it is applied to.
         #
         #   nixpkgs.overlays = [
-        #     (nix-stubs.lib.mkOverlay { lock = ./stubs.lock; flakeLock = ./flake.lock; })
+        #     (nix-stubs.lib.mkOverlay {
+        #       stubs = pkgs: import ./stubs.nix { inherit pkgs; };
+        #       lock = ./stubs.lock;
+        #       flakeLock = ./flake.lock;
+        #     })
         #   ];
-        inherit (lockLib) mkOverlay drvRef assertSync;
+        inherit (lockLib) mkOverlay assertSync read defaultBin;
       } // forAllSystems ({ pkgs, system, ... }:
         import ./nix/lib.nix {
           inherit pkgs;

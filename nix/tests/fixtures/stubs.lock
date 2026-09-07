@@ -10,5 +10,42 @@
       "type": "github"
     }
   },
-  "packages": {}
+  "packages": {
+    "x86_64-linux": {
+      "locked-tool": {
+        "attr": "hello",
+        "drv": "/nix/store/00000000000000000000000000000000-not-a-real-recipe.drv",
+        "output": "out",
+        "bins": [ "locked-tool" ],
+        "name": "locked-tool"
+      }
+    },
+    "aarch64-linux": {
+      "locked-tool": {
+        "attr": "hello",
+        "drv": "/nix/store/00000000000000000000000000000000-not-a-real-recipe.drv",
+        "output": "out",
+        "bins": [ "locked-tool" ],
+        "name": "locked-tool"
+      }
+    },
+    "x86_64-darwin": {
+      "locked-tool": {
+        "attr": "hello",
+        "drv": "/nix/store/00000000000000000000000000000000-not-a-real-recipe.drv",
+        "output": "out",
+        "bins": [ "locked-tool" ],
+        "name": "locked-tool"
+      }
+    },
+    "aarch64-darwin": {
+      "locked-tool": {
+        "attr": "hello",
+        "drv": "/nix/store/00000000000000000000000000000000-not-a-real-recipe.drv",
+        "output": "out",
+        "bins": [ "locked-tool" ],
+        "name": "locked-tool"
+      }
+    }
+  }
 }

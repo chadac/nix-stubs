@@ -31,9 +31,8 @@ let
 
   # stubs.lock is synced to flake.lock: every input it pins must still be pinned
   # to the same revision by the consumer's flake.lock. A nixpkgs bump therefore
-  # fails loudly at eval instead of silently shipping stubs built from the old
-  # revision (the stub would still WORK — the recipe is self-contained — it would
-  # just be a different version of the tool than the rest of the system).
+  # fails loudly instead of silently shipping stubs recorded against the old
+  # revision.
   syncErrors = { lock, flakeLock }:
     lib.filter (e: e != null) (lib.mapAttrsToList
       (name: pinned:
@@ -57,33 +56,42 @@ let
       Check it in CI with:  nix run github:chadac/nix-stubs#check
     '';
 
-  # Re-attach the dependency edge to a .drv path read out of stubs.lock.
-  #
-  # A string from a JSON file has no context, so interpolating it into the shim
-  # would name a .drv that Nix never copies anywhere — and binary caches do not
-  # serve .drv paths, so nothing can recover it at runtime. `path = true` is
-  # opaque context: the .drv lands in the stub's inputSrcs, which drags in the
-  # .drv's own store references (its input drvs and sources) — the complete
-  # build recipe, and none of the build OUTPUTS.
-  #
-  # `builtins.storePath` produces the same context but is rejected in pure
-  # evaluation mode, which is the default for flakes.
-  drvRef = p: builtins.appendContext p { ${p} = { path = true; }; };
+  defaultBin = pkg: pkg.meta.mainProgram or (builtins.parseDrvName pkg.name).name;
+
+  normalize = name: decl:
+    if lib.isDerivation decl
+    then { package = decl; attr = name; bins = null; output = null; }
+    else {
+      inherit (decl) package;
+      attr = decl.attr or name;
+      bins = decl.bins or null;
+      output = decl.output or null;
+    };
 
 in
 {
-  inherit lockedInput syncErrors assertSync drvRef;
+  inherit lockedInput syncErrors assertSync defaultBin;
 
   read = asAttrs;
 
-  # Turn stubs.lock into a nixpkgs overlay.
+  # Turn a stub set into a nixpkgs overlay, replacing each declared attribute
+  # with a stub that carries the package's RECIPE and not the package.
   #
-  # For each locked package, `pkgs.<attr>` becomes a stub. No evaluation of the
-  # real package happens — that is the whole point of the lock — but `prev.<attr>`
-  # stays reachable through passthru, and Nix's laziness means it is never forced
-  # unless something asks for it.
+  # The drv comes from evaluating the package, not from stubs.lock. A drv path
+  # in a JSON file is inert: to be usable it has to be a dependency, and the
+  # only ways to make it one are eval-time context (builtins.appendContext and
+  # builtins.storePath both call ensurePath, so they require the .drv to already
+  # be in the evaluating machine's store — and no binary cache serves .drv
+  # paths) or shipping the recipe out of band. So the lock cannot replace
+  # evaluation; it records what the evaluation is expected to produce, and
+  # `nix-stubs check` enforces that in CI.
+  #
+  #   stubs      pkgs -> attrset of declarations (usually `import ./stubs.nix`)
+  #   lock       ./stubs.lock — supplies discovered bins/output, and the pins
+  #   flakeLock  ./flake.lock — the lock must still agree with it
   mkOverlay =
-    { lock
+    { stubs
+    , lock
     , flakeLock
     , lockPath ? "stubs.lock"
     , nix-stubs ? null
@@ -95,33 +103,62 @@ in
       synced = assertSync { lock = lock'; flakeLock = flakeLock'; inherit lockPath; };
 
       system = prev.stdenv.hostPlatform.system;
-      entries = lock'.packages.${system} or (throw ''
-        nix-stubs: ${lockPath} has no packages for system '${system}'.
-        Regenerate with: nix run github:chadac/nix-stubs#gen -- --system ${system}
-      '');
+      locked = lock'.packages.${system} or (throw "nix-stubs: ${lockPath} has no packages for system ${system}");
+
+      # `prev`, not `final`: a stub set that reached for the stubbed attributes
+      # would be its own input.
+      decls = stubs prev;
+
+      declFor = name:
+        normalize name (decls.${name} or (throw ''
+          nix-stubs: ${lockPath} has an entry for '${name}', but stubs.nix does
+          not declare it. Regenerate the lock: nix run github:chadac/nix-stubs#gen
+        ''));
 
       pkg = if nix-stubs != null then nix-stubs else prev.callPackage ./package.nix { };
       mkStub = import ./shim.nix { pkgs = prev; nix-stubs = pkg; };
 
-      # Keyed by the nixpkgs attribute being replaced, which is `attr` when the
-      # stub is named differently from the attribute it stands in for.
+      # Iterating the LOCK rather than the declarations is what keeps this
+      # terminating. The overlay's attribute names have to be known before the
+      # package set is complete, and the lock supplies them as plain strings.
+      # Deriving a name from a declaration instead means forcing `prev.<attr>`
+      # mid-construction, which is an infinite recursion.
       stubFor = name: entry:
-        let real = prev.${entry.attr or name};
-        in lib.nameValuePair (entry.attr or name) (mkStub {
+        let
+          d = declFor name;
+          real = d.package;
+        in
+        lib.nameValuePair (entry.attr or d.attr) (mkStub {
           inherit name;
-          drv = drvRef entry.drv;
-          output = entry.output or "out";
-          bins = entry.bins;
+          # Context matters: `drvPath` carries an allOutputs edge that would drag
+          # the built package in. Discarding the OUTPUT dependency drops that
+          # edge and keeps the .drv — and its own input closure — as a real
+          # dependency, so the recipe travels with the stub.
+          drv = builtins.unsafeDiscardOutputDependency real.drvPath;
+          # The lock wins over the declaration: it is where `--discover-bins`
+          # results are recorded, and `check` keeps the two from disagreeing.
+          #
+          # Spelled out rather than chained with `or`: that operator is attribute
+          # selection with a default, so an attribute that exists and is null
+          # wins over the fallback instead of deferring to it.
+          bins =
+            if entry ? bins then entry.bins
+            else if d.bins != null then d.bins
+            else [ (defaultBin real) ];
+          output =
+            if entry ? output then entry.output
+            else if d.output != null then d.output
+            else real.outputName or "out";
           passthru = {
             # nixpkgs routes every buildInputs/nativeBuildInputs element through
             # getDev (lib/attrsets.nix), which prefers `.dev`. Pointing it at the
-            # real package keeps the stub off build inputs — a build sandbox has
-            # no daemon socket and could not realise it. `passthru` is eval-only
+            # real package keeps stubs off build inputs — a build sandbox has no
+            # daemon socket and could not realise one. `passthru` is eval-only
             # and never enters the .drv, so the stub's closure is unaffected.
             dev = real;
             real = real;
           };
         });
     in
-    lib.optionalAttrs synced (lib.mapAttrs' stubFor entries);
+    lib.optionalAttrs synced (lib.mapAttrs' stubFor locked);
 }

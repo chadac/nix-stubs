@@ -18,7 +18,13 @@ instead of 449 MB.
 
 ```nix
 # apply the generated lock as an overlay
-overlays = [ (nix-stubs.lib.mkOverlay { lock = ./stubs.lock; flakeLock = ./flake.lock; }) ];
+overlays = [
+  (nix-stubs.lib.mkOverlay {
+    stubs = pkgs: import ./stubs.nix { inherit pkgs; inputs = self.inputs; };
+    lock = ./stubs.lock;
+    flakeLock = ./flake.lock;
+  })
+];
 ```
 
 `pkgs.awscli2` is now a stub. `environment.systemPackages = [ pkgs.awscli2 ]`
@@ -92,9 +98,16 @@ nix run github:chadac/nix-stubs#gen        # writes ./stubs.lock
 ```
 
 The lock records each package's `.drv`, output name and bins. It is a
-**build-time artifact** — nothing reads it at runtime. Its job is to let the
-overlay construct stubs *without evaluating the packages they stand for*, so
-bumping nixpkgs doesn't re-evaluate every stubbed package.
+**build-time artifact** — nothing reads it at runtime.
+
+It records what evaluation is expected to produce; it does not replace
+evaluation. A `.drv` path in a JSON file is inert — to be usable it has to be a
+*dependency*, and the only ways to make one are eval-time context
+(`builtins.appendContext` and `builtins.storePath` both call `ensurePath`, so
+they need the `.drv` already in the evaluating machine's store, and no cache
+serves `.drv` paths) or shipping the recipe out of band. So the overlay
+evaluates `stubs.nix` for the drv, and the lock's job is to pin the inputs, carry
+`--discover-bins` results, and let `nix-stubs check` catch drift in CI.
 
 | flag | default | |
 |---|---|---|
@@ -168,7 +181,7 @@ nix-stubs gen --flake . --attr stubs
 nix-stubs check --fast
 ```
 
-`nix-stubs.lib.mkOverlay`, `.drvRef` and `.assertSync` are system-agnostic;
+`nix-stubs.lib.mkOverlay` and `.assertSync` are system-agnostic;
 `nix-stubs.lib.${system}.mkStub` builds a single stub by hand.
 
 ## Tests

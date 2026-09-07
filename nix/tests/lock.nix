@@ -1,8 +1,8 @@
 { pkgs, nix-stubs, lockLib }:
 
-# Eval-level properties of the lock-driven overlay. Deliberately not a VM test:
-# every claim here is decided at evaluation and build time — what a stub's
-# closure contains, and when the sync check fires.
+# Eval-level properties of the overlay. Deliberately not a VM test: every claim
+# here is decided at evaluation and build time. Runtime behaviour — including
+# the closure guarantee in a real store — is in ./integration.nix.
 
 let
   inherit (pkgs) lib;
@@ -16,64 +16,50 @@ let
   # consumer reads it (a path) instead of through import-from-derivation.
   fixture = ./fixtures;
 
-  mkLock = drv: {
-    version = 1;
-    inputs.nixpkgs = (lockLib.read "${fixture}/stubs.lock").inputs.nixpkgs;
-    packages.${system}.locked-tool = {
-      # `attr` differs from the entry name on purpose: the overlay must replace
-      # the ATTRIBUTE, not the name the stub was declared under.
-      attr = "hello";
-      inherit drv;
-      output = "out";
-      bins = [ "locked-tool" ];
-      name = "locked-tool";
-    };
+  # `attr` differs from the entry name on purpose: the overlay must replace the
+  # ATTRIBUTE, not the name the stub was declared under.
+  stubs = _: {
+    locked-tool = { package = real; attr = "hello"; };
   };
 
-  overlay = lockLib.mkOverlay {
-    lock = mkLock realDrv;
-    flakeLock = "${fixture}/flake.lock";
-    inherit nix-stubs;
+  mkOverlay = flakeLock: lockLib.mkOverlay {
+    inherit stubs nix-stubs;
+    lock = "${fixture}/stubs.lock";
+    flakeLock = "${fixture}/${flakeLock}";
   };
 
-  stubbed = pkgs.extend overlay;
+  stubbed = pkgs.extend (mkOverlay "flake.lock");
   stub = stubbed.hello;
 
   # A lock whose nixpkgs pin no longer matches flake.lock must not evaluate.
-  staleOverlay = lockLib.mkOverlay {
-    lock = mkLock realDrv;
-    flakeLock = "${fixture}/flake-moved.lock";
-    inherit nix-stubs;
-  };
-  stale = builtins.tryEval (builtins.attrNames (staleOverlay pkgs pkgs));
-
-  # The dependency edge, asserted directly. `path = true` is opaque context: it
-  # puts the .drv in the stub's inputSrcs, which is what makes Nix copy the
-  # recipe (and its own store references) along with the stub. A context-free
-  # string here is the failure mode this project exists to avoid — a stub naming
-  # a .drv that was never copied anywhere and that no cache will serve.
-  drvContext = builtins.getContext (lockLib.drvRef realDrv);
+  stale = builtins.tryEval (builtins.attrNames ((mkOverlay "flake-moved.lock") pkgs pkgs));
 
 in
-
-assert lib.assertMsg (drvContext.${realDrv}.path or false)
-  "a drv path read from stubs.lock must carry opaque context, or the recipe never travels with the stub";
-
-assert lib.assertMsg (!(drvContext.${realDrv}.allOutputs or false))
-  "the stub must not depend on the package's OUTPUTS — that is the 449 MB it exists to avoid";
 
 assert lib.assertMsg (!stale.success)
   "a stubs.lock whose inputs disagree with flake.lock must throw, not silently build stale stubs";
 
-assert lib.assertMsg (stub.passthru.real == pkgs.hello)
+assert lib.assertMsg (stub.passthru.real == real)
   "passthru.real must be the package the stub stands in for";
 
-assert lib.assertMsg (stub.passthru.dev == pkgs.hello)
+assert lib.assertMsg (stub.passthru.dev == real)
   "passthru.dev must be the real package, so buildInputs never receive a stub";
 
-# What the generated shim says. The closure itself is asserted in the VM test
-# (integration.nix, "shim closure EXCLUDES the realised package"), where a real
-# store is available to query.
+# The recipe must be a real dependency of the stub. Opaque context on the .drv
+# is what makes Nix copy it — and its own store references — along with the
+# stub; allOutputs context would additionally drag in the built package.
+assert
+  let ctx = builtins.getContext (builtins.unsafeDiscardOutputDependency real.drvPath);
+  in lib.assertMsg (ctx.${realDrv}.path or false)
+    "the stub's drv reference must carry opaque context, or the recipe never travels with it";
+
+assert
+  let ctx = builtins.getContext (builtins.unsafeDiscardOutputDependency real.drvPath);
+  in lib.assertMsg (!(ctx.${realDrv}.allOutputs or false))
+    "the stub must not depend on the package's OUTPUTS — that is what it exists to avoid shipping";
+
+# What the generated shim says. The closure itself is asserted in the VM test,
+# where a real store is available to query.
 pkgs.runCommand "nix-stubs-lock-test" { } ''
   shim=${stub}/bin/locked-tool
 
@@ -91,6 +77,15 @@ pkgs.runCommand "nix-stubs-lock-test" { } ''
   echo "--- and must select its output by name ---"
   grep -q -- '--output "out"' "$shim" \
     || { echo "FAIL: shim does not pass --output; multi-output packages would be a coin flip"; exit 1; }
+
+  # The fixture lock names a drv that does not exist. The shim must carry the
+  # one evaluation produced, because a drv path in a JSON file is inert — it can
+  # name a recipe but it cannot make one a dependency.
+  echo "--- and must NOT take its recipe from the lock's text ---"
+  if grep -q 'not-a-real-recipe' "$shim"; then
+    echo "FAIL: shim used the lock's drv string instead of the evaluated package"
+    exit 1
+  fi
 
   touch $out
 ''
