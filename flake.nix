@@ -74,9 +74,11 @@
         };
 
         lock = import ./nix/tests/lock.nix {
-          inherit pkgs;
+          inherit pkgs lockLib;
           nix-stubs = self.packages.${system}.nix-stubs;
-          inherit lockLib;
+          stubsNix = ./stubs.nix;
+          stubsLock = ./stubs.lock;
+          flakeLock = ./flake.lock;
         };
 
         # The overlay end-to-end in a booted system, against this repo's own
