@@ -21,6 +21,10 @@ let
     inherit nix-stubs;
   });
 
+  # The DERIVATION, for seeding. A context-free string here would seed nothing:
+  # extraDependencies needs a real dependency to copy the path into the VM store,
+  # which is the same lesson this project is built on.
+  realHello = pkgs.hello;
   realHelloOut = builtins.unsafeDiscardStringContext (toString pkgs.hello);
   helloRecipe = builtins.unsafeDiscardStringContext pkgs.hello.drvPath;
 in
@@ -36,9 +40,11 @@ pkgs.testers.runNixOSTest {
     # Straight from the overlay: these are stubs, and nothing here says so.
     environment.systemPackages = [ pkgs.hello pkgs.ripgrep pkgs.ttyd ];
 
-    # Seed the real outputs (from the UN-stubbed set) so a shim finds them
-    # already realised — the VM has no network.
-    system.extraDependencies = [ realHelloOut ];
+    # Seed the real output into the VM STORE so a shim finds it already realised
+    # (the VM has no network) WITHOUT adding it to the system closure —
+    # system.extraDependencies would, which is exactly what the closure assertion
+    # below must be able to rule out.
+    virtualisation.additionalPaths = [ realHello ];
 
     nix.settings.experimental-features = [ "nix-command" ];
   };
@@ -67,6 +73,10 @@ pkgs.testers.runNixOSTest {
         closure = machine.succeed("nix-store -q --requisites /run/current-system")
         assert "${helloRecipe}" in closure, \
             "MISSING RECIPE: hello's .drv is absent, so it could never be realised"
+        # The package is present in the VM store (seeded, so the shim can exec it)
+        # but must NOT be part of the system — that is the whole point.
+        assert "${realHelloOut}" not in closure, \
+            "LEAK: hello's built output is in the system closure"
 
     with subtest("a stub execs the real tool"):
         out = machine.succeed("hello")
