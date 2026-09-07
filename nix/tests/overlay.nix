@@ -47,12 +47,16 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("default.target")
 
     with subtest("the overlay put stubs on PATH, under the right command names"):
-        hello = machine.succeed("readlink -f $(command -v hello)").strip()
-        assert "stub-hello" in hello, f"hello on PATH is not a stub: {hello}"
+        # Assert on CONTENT, not on the store path name: `readlink -f` follows
+        # through symlinkJoin into the per-command shim, whose derivation is named
+        # for the COMMAND (…-hello), so a name check reads as "not a stub" even
+        # when it is one.
+        hello = machine.succeed("cat $(command -v hello)")
+        assert "nix-stubs exec" in hello, f"hello on PATH is not a stub:\n{hello}"
 
         # `rg`, not `ripgrep`: the command name comes from stubs.nix's `bins`.
-        rg = machine.succeed("readlink -f $(command -v rg)").strip()
-        assert "stub-ripgrep" in rg, f"rg on PATH is not a stub: {rg}"
+        rg = machine.succeed("cat $(command -v rg)")
+        assert "nix-stubs exec" in rg, f"rg on PATH is not a stub:\n{rg}"
 
         # A MULTI-OUTPUT package survives systemPackages. Before the stub
         # overrode meta.outputsToInstall, buildEnv failed the whole system build
