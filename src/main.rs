@@ -1,7 +1,9 @@
+mod gen;
+mod lock;
+mod recipe;
+
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::fs;
+use gen::GenOpts;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -21,6 +23,10 @@ enum Commands {
         #[arg(long)]
         drv_path: String,
 
+        /// Output name to exec from (e.g. "out", "bin")
+        #[arg(long, default_value = "out")]
+        output: String,
+
         /// Output store path (optional; resolved from drv-path if omitted)
         #[arg(long)]
         out_path: Option<String>,
@@ -28,6 +34,10 @@ enum Commands {
         /// Binary name override (defaults to tool name)
         #[arg(long)]
         bin: Option<String>,
+
+        /// Recipe blob to import when the .drv is not in the store
+        #[arg(long)]
+        recipe: Option<String>,
 
         /// Tool name
         tool: String,
@@ -37,115 +47,275 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Output shell activation hooks
-    Activate {
-        /// Shell type
-        shell: Shell,
-
-        /// Path to manifest JSON
+    /// Pack a .drv's build graph into a recipe blob (a nix-store export stream)
+    Recipe {
+        /// Where to write the blob
         #[arg(long)]
-        manifest: String,
+        out: Option<String>,
 
-        /// Path to shim directory
+        /// Print the closure in packing order instead of writing a blob
         #[arg(long)]
-        shim_dir: String,
+        list: bool,
+
+        /// Root .drv paths to pack
+        roots: Vec<String>,
     },
 
-    /// Check realized status and output PATH updates (called by shell hook)
-    HookEnv {
-        /// Path to manifest JSON
+    /// Generate stubs.lock from a flake's stub set
+    Gen {
+        /// Flake containing the stub set
+        #[arg(long, default_value = ".")]
+        flake: String,
+
+        /// Flake output attribute holding the stub set
+        #[arg(long, default_value = "stubs")]
+        attr: String,
+
+        /// Systems to lock (repeatable; defaults to the current system)
+        #[arg(long = "system")]
+        systems: Vec<String>,
+
+        /// Path to stubs.lock
+        #[arg(long, default_value = "stubs.lock")]
+        lock: String,
+
+        /// Path to the flake.lock stubs.lock is synced to
+        #[arg(long = "flake-lock", default_value = "flake.lock")]
+        flake_lock: String,
+
+        /// Flake inputs to pin (repeatable; defaults to those already locked, else nixpkgs)
+        #[arg(long = "input")]
+        inputs: Vec<String>,
+
+        /// Build each package and enumerate $out/bin instead of trusting stubs.nix
         #[arg(long)]
-        manifest: String,
+        discover_bins: bool,
+    },
+
+    /// Verify stubs.lock is in sync with flake.lock and stubs.nix (CI check)
+    Check {
+        #[arg(long, default_value = ".")]
+        flake: String,
+
+        #[arg(long, default_value = "stubs")]
+        attr: String,
+
+        #[arg(long, default_value = "stubs.lock")]
+        lock: String,
+
+        #[arg(long = "flake-lock", default_value = "flake.lock")]
+        flake_lock: String,
+
+        /// Only compare inputs against flake.lock; skip re-evaluating stubs.nix
+        #[arg(long)]
+        fast: bool,
     },
 }
 
-#[derive(Clone, clap::ValueEnum)]
-enum Shell {
-    Bash,
-    Zsh,
-    Fish,
-}
-
-#[derive(Deserialize)]
-struct Manifest {
-    tools: HashMap<String, ToolEntry>,
-}
-
-#[derive(Deserialize)]
-struct ToolEntry {
-    #[allow(dead_code)]
-    drv_path: String,
-    out_path: String,
-    #[allow(dead_code)]
-    commands: Vec<String>,
-}
-
-fn resolve_out_path(drv_path: &str) -> Result<String, String> {
-    let output = Command::new("nix-store")
-        .args(["--query", "--outputs", drv_path])
+/// Resolve an output BY NAME without realising anything.
+///
+/// `--query --binding <name>` reads the output path out of the .drv's own
+/// environment. The obvious `--query --outputs` returns every output in
+/// unspecified order, so taking the first is a coin flip on any multi-output
+/// package (awscli2 has `out` and `dist`).
+fn resolve_out_path(drv_path: &str, output: &str) -> Result<String, String> {
+    let result = Command::new("nix-store")
+        .args(["--query", "--binding", output, drv_path])
         .output()
         .map_err(|e| format!("failed to run nix-store: {e}"))?;
 
-    if !output.status.success() {
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        if stderr.contains("no substituter") || stderr.contains("is not valid") {
+            return Err(format!(
+                "the recipe for this tool is missing from the store:\n  {drv_path}\n\
+                 Binary caches do not serve .drv paths, so it cannot be fetched — it comes \
+                 from the stub's recipe blob. The stub was built without one, or the import \
+                 failed; rebuild it with a nix-stubs that passes --recipe."
+            ));
+        }
         return Err(format!(
-            "nix-store --query --outputs failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "nix-store --query --binding {output} failed: {}",
+            stderr.trim()
         ));
     }
 
-    let out = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
-
+    let out = String::from_utf8_lossy(&result.stdout).trim().to_string();
     if out.is_empty() {
-        return Err("nix-store returned empty output path".to_string());
+        return Err(format!("{drv_path} has no output named '{output}'"));
     }
-
     Ok(out)
 }
 
-fn realize(drv_path: &str, tool: &str) -> Result<(), String> {
-    eprintln!("nix-stubs: installing {tool}...");
+/// Put the recipe back in the store.
+///
+/// The blob is an ordinary derivation output — that is the whole point, since a
+/// .drv shipped as itself breaks closure enumeration and no cache serves one —
+/// so the .drv only becomes a real store path here, on first use.
+fn import_recipe(blob: &str, tool: &str) -> Result<(), String> {
+    let file = std::fs::File::open(blob)
+        .map_err(|e| format!("the recipe blob for {tool} is missing:\n  {blob}\n  {e}"))?;
 
-    let status = Command::new("nix-store")
+    let result = Command::new("nix-store")
+        .arg("--import")
+        .stdin(file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run nix-store --import: {e}"))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        // The blob is unsigned: nothing signs a path that is generated inside a
+        // build sandbox. Untrusted users cannot import one, and the generic
+        // "cannot add path" is not a useful thing to hand a user.
+        if stderr.contains("lacks a signature") || stderr.contains("untrusted") {
+            return Err(format!(
+                "cannot import the recipe for '{tool}': this user is not a trusted \
+                 nix user, and a recipe blob carries no signature.\n\
+                 Add yourself to `trusted-users` in nix.conf, or realise the tool \
+                 as root once."
+            ));
+        }
+        return Err(format!(
+            "nix-store --import failed for {tool}: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// A stub that still has work to do needs the daemon, which a build sandbox does
+/// not have. Checked before the import as well as before the realise: with the
+/// recipe now shipped as a blob, importing it is the first thing that would fail,
+/// and it fails as an opaque "cannot add path" instead of naming the escape hatch.
+fn refuse_in_build_sandbox(tool: &str) -> Result<(), String> {
+    if std::env::var_os("NIX_BUILD_TOP").is_some() {
+        return Err(format!(
+            "'{tool}' is a lazy stub and cannot be realised inside a build sandbox.\n\
+             Use the real package for build inputs: pkgs.{tool}.real (buildInputs already \
+             get it via getDev)."
+        ));
+    }
+    Ok(())
+}
+
+fn realize(drv_path: &str, out_path: &str, tool: &str) -> Result<(), String> {
+    refuse_in_build_sandbox(tool)?;
+
+    // Substitute-first, and against the OUTPUT PATH rather than the .drv: a
+    // cache hit is silent, and a MISS is where the user finds out they are about
+    // to compile rather than a stub appearing to hang for 40 minutes.
+    //
+    // Asking for the path is also the only form that is safe here. Handing
+    // nix-store a freshly imported .drv makes it plan a derivation goal, and
+    // nix 2.34 ABORTS on an assertion inside Goal::work() when it does — a
+    // crash, not a cache miss, so the stub fell through to building stdenv from
+    // source. A path goal cannot build anything, so `--max-jobs 0` is implied.
+    eprintln!("nix-stubs: fetching {tool}...");
+    let substituted = Command::new("nix-store")
+        .args(["--realise", out_path])
+        .stdout(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run nix-store: {e}"))?;
+
+    if substituted.status.success() {
+        return Ok(());
+    }
+
+    // Why it missed, not just that it did: "no substituter" and "signature"
+    // and "not allowed to build" are three different problems for the user, and
+    // the next line commits them to a build that can take 40 minutes.
+    let why = String::from_utf8_lossy(&substituted.stderr);
+    for line in why.lines().filter(|l| !l.trim().is_empty()).take(3) {
+        eprintln!("nix-stubs: {}", line.trim());
+    }
+
+    if std::env::var_os("NIX_STUBS_NO_BUILD").is_some() {
+        return Err(format!(
+            "{tool} is not in any configured binary cache, and NIX_STUBS_NO_BUILD is set."
+        ));
+    }
+
+    eprintln!("nix-stubs: {tool} is not in any binary cache — building it from source.");
+    eprintln!("nix-stubs: this can take a while. Set NIX_STUBS_NO_BUILD=1 to fail instead.");
+
+    let built = Command::new("nix-store")
         .args(["--realise", drv_path])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
         .status()
         .map_err(|e| format!("failed to run nix-store: {e}"))?;
 
-    if !status.success() {
+    if !built.success() {
         return Err(format!("nix-store --realise failed for {tool}"));
     }
-
     Ok(())
 }
 
 fn cmd_exec(
     drv_path: String,
+    output: String,
     out_path: Option<String>,
     bin: Option<String>,
+    recipe: Option<String>,
     tool: String,
     args: Vec<String>,
 ) {
+    let die = |e: String| -> ! {
+        eprintln!("nix-stubs: {e}");
+        std::process::exit(1)
+    };
+
+    // The .drv is absent until something imports the blob — a stub ships the
+    // recipe as an opaque output, not as store derivations.
+    //
+    // Driven by nix REJECTING the .drv, not by the file being absent: a store
+    // image can carry the .drv file without registering it as valid (a NixOS VM
+    // does exactly this), and then an existence check skips the import and every
+    // later nix call fails with "path … is not valid".
+    let import_once = std::cell::Cell::new(false);
+    let ensure_recipe = || {
+        if import_once.replace(true) {
+            return false;
+        }
+        match &recipe {
+            None => false,
+            Some(blob) => {
+                if let Err(e) =
+                    refuse_in_build_sandbox(&tool).and_then(|_| import_recipe(blob, &tool))
+                {
+                    die(e);
+                }
+                true
+            }
+        }
+    };
+
     let out_path = match out_path {
+        // An out-path in the shim means the common case (the tool is already
+        // realised) costs no nix-store call and no import at all.
         Some(p) => p,
-        None => match resolve_out_path(&drv_path) {
+        None => match resolve_out_path(&drv_path, &output) {
             Ok(p) => p,
+            // The recipe is the only way that lookup can start working, so retry
+            // exactly once behind it rather than reporting the first failure.
             Err(e) => {
-                eprintln!("nix-stubs: {e}");
-                std::process::exit(1);
+                if !ensure_recipe() {
+                    die(e);
+                }
+                match resolve_out_path(&drv_path, &output) {
+                    Ok(p) => p,
+                    Err(e) => die(e),
+                }
             }
         },
     };
 
     if !Path::new(&out_path).exists() {
-        if let Err(e) = realize(&drv_path, &tool) {
-            eprintln!("nix-stubs: {e}");
-            std::process::exit(1);
+        ensure_recipe();
+        if let Err(e) = realize(&drv_path, &out_path, &tool) {
+            die(e);
         }
     }
 
@@ -162,92 +332,34 @@ fn cmd_exec(
     std::process::exit(1);
 }
 
-fn cmd_activate(shell: Shell, manifest: String, shim_dir: String) {
-    match shell {
-        Shell::Bash => {
-            println!(
-                r#"# nix-stubs shell activation (bash)
-export PATH="${{PATH}}:{shim_dir}"
-__nix_stubs_hook() {{
-  local new_path
-  new_path="$(nix-stubs hook-env --manifest "{manifest}" 2>/dev/null)"
-  if [ -n "$new_path" ]; then
-    export PATH="$new_path"
-  fi
-}}
-if [[ ! "${{PROMPT_COMMAND:-}}" =~ __nix_stubs_hook ]]; then
-  PROMPT_COMMAND="__nix_stubs_hook${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}"
-fi"#
-            );
-        }
-        Shell::Zsh => {
-            println!(
-                r#"# nix-stubs shell activation (zsh)
-export PATH="${{PATH}}:{shim_dir}"
-__nix_stubs_hook() {{
-  local new_path
-  new_path="$(nix-stubs hook-env --manifest "{manifest}" 2>/dev/null)"
-  if [[ -n "$new_path" ]]; then
-    export PATH="$new_path"
-  fi
-}}
-if (( ! ${{precmd_functions[(I)__nix_stubs_hook]}} )); then
-  precmd_functions+=(__nix_stubs_hook)
-fi"#
-            );
-        }
-        Shell::Fish => {
-            println!(
-                r#"# nix-stubs shell activation (fish)
-set -gx PATH $PATH "{shim_dir}"
-function __nix_stubs_hook --on-event fish_prompt
-  set -l new_path (nix-stubs hook-env --manifest "{manifest}" 2>/dev/null)
-  if test -n "$new_path"
-    set -gx PATH (string split ":" -- $new_path)
-  end
-end"#
-            );
-        }
-    }
-}
-
-fn cmd_hook_env(manifest: String) {
-    let manifest_contents = match fs::read_to_string(&manifest) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("nix-stubs: failed to read manifest {manifest}: {e}");
-            std::process::exit(1);
+fn gen_opts(
+    flake: String,
+    attr: String,
+    systems: Vec<String>,
+    lock_path: String,
+    flake_lock_path: String,
+    inputs: Vec<String>,
+    discover_bins: bool,
+) -> GenOpts {
+    // An explicit --input wins; otherwise reuse whatever the lock already pins,
+    // so a plain `gen` after the first one keeps the same input set.
+    let inputs = if !inputs.is_empty() {
+        inputs
+    } else {
+        match lock::Lock::read(&lock_path) {
+            Ok(l) if !l.inputs.is_empty() => l.inputs.keys().cloned().collect(),
+            _ => vec!["nixpkgs".to_string()],
         }
     };
-
-    let manifest: Manifest = match serde_json::from_str(&manifest_contents) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("nix-stubs: failed to parse manifest: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let current_entries: Vec<&str> = current_path.split(':').collect();
-
-    // Collect bin dirs for realized packages
-    let mut realized_dirs: Vec<String> = Vec::new();
-    for entry in manifest.tools.values() {
-        let bin_dir = format!("{}/bin", entry.out_path);
-        if Path::new(&bin_dir).exists() && !current_entries.contains(&bin_dir.as_str()) {
-            realized_dirs.push(bin_dir);
-        }
+    GenOpts {
+        flake,
+        attr,
+        systems,
+        lock_path,
+        flake_lock_path,
+        inputs,
+        discover_bins,
     }
-
-    if realized_dirs.is_empty() {
-        // No changes needed — output nothing
-        return;
-    }
-
-    // Prepend realized dirs to PATH (before existing entries)
-    realized_dirs.extend(current_entries.iter().map(|s| s.to_string()));
-    println!("{}", realized_dirs.join(":"));
 }
 
 fn main() {
@@ -256,16 +368,40 @@ fn main() {
     match cli.command {
         Commands::Exec {
             drv_path,
+            output,
             out_path,
             bin,
+            recipe,
             tool,
             args,
-        } => cmd_exec(drv_path, out_path, bin, tool, args),
-        Commands::Activate {
-            shell,
-            manifest,
-            shim_dir,
-        } => cmd_activate(shell, manifest, shim_dir),
-        Commands::HookEnv { manifest } => cmd_hook_env(manifest),
+        } => cmd_exec(drv_path, output, out_path, bin, recipe, tool, args),
+        Commands::Recipe { out, list, roots } => recipe::cmd_export(roots, out, list),
+        Commands::Gen {
+            flake,
+            attr,
+            systems,
+            lock,
+            flake_lock,
+            inputs,
+            discover_bins,
+        } => gen::cmd_gen(gen_opts(
+            flake,
+            attr,
+            systems,
+            lock,
+            flake_lock,
+            inputs,
+            discover_bins,
+        )),
+        Commands::Check {
+            flake,
+            attr,
+            lock,
+            flake_lock,
+            fast,
+        } => gen::cmd_check(
+            gen_opts(flake, attr, vec![], lock, flake_lock, vec![], false),
+            fast,
+        ),
     }
 }

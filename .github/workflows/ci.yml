@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  # Fast feedback: the lock check is two JSON files and no evaluation, so it
+  # fails in seconds when someone bumps flake.lock without regenerating.
+  lock:
+    name: stubs.lock is in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: inputs match flake.lock
+        run: nix run .#check -- --fast
+
+      # Re-evaluates stubs.nix and compares drv paths, catching drift the input
+      # pins cannot see (an overlay, an override, an edited stubs.nix).
+      - name: lock matches stubs.nix
+        run: nix run .#check
+
+  build:
+    name: build + eval checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: build nix-stubs
+        run: nix build .#nix-stubs -L
+
+      - name: eval-level lock checks
+        run: nix build .#checks.x86_64-linux.lock -L
+
+      # RED until stubs stop shipping .drv files in their closure. Enumerating a
+      # stub's closure is what every image builder does, so this failing here is
+      # the point — it took down scooter's image build before this repo noticed.
+      - name: closure enumeration
+        run: nix build .#checks.x86_64-linux.closure -L
+
+      - name: rustfmt
+        run: nix develop -c cargo fmt --check
+
+      - name: clippy
+        run: nix develop -c cargo clippy --all-targets -- -D warnings
+
+  vm:
+    name: VM integration test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # nixosTest boots a real VM; the runner's /dev/kvm is root-only by default.
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: integration test
+        run: nix build .#checks.x86_64-linux.integration -L
+
+      # The overlay end-to-end: stubs.nix -> lock -> systemPackages -> a tool that
+      # runs. Catches what the mechanism-level test cannot, e.g. a stub inheriting
+      # meta.outputsToInstall it cannot satisfy.
+      - name: overlay test
+        run: nix build .#checks.x86_64-linux.overlay -L

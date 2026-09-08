@@ -12,19 +12,58 @@
         pkgs = nixpkgs.legacyPackages.${system};
         inherit system;
       });
+
+      lockLib = import ./nix/lock.nix { inherit (nixpkgs) lib; };
+
+      # `nix run .#gen` / `.#check` — apps append the user's args, so the
+      # subcommand has to be baked in.
+      wrap = pkgs: system: sub: pkgs.writeShellScriptBin "nix-stubs-${sub}" ''
+        exec ${self.packages.${system}.nix-stubs}/bin/nix-stubs ${sub} "$@"
+      '';
     in
     {
-      packages = forAllSystems ({ pkgs, ... }: {
+      packages = forAllSystems ({ pkgs, system, ... }: {
         nix-stubs = pkgs.callPackage ./nix/package.nix { };
-        default = self.packages.${pkgs.system}.nix-stubs;
+        default = self.packages.${system}.nix-stubs;
       });
 
-      lib = forAllSystems ({ pkgs, ... }:
+      apps = forAllSystems ({ pkgs, system, ... }: {
+        gen = {
+          type = "app";
+          program = "${wrap pkgs system "gen"}/bin/nix-stubs-gen";
+        };
+        check = {
+          type = "app";
+          program = "${wrap pkgs system "check"}/bin/nix-stubs-check";
+        };
+      });
+
+      devShells = forAllSystems ({ pkgs, ... }: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [ cargo rustc clippy rustfmt ];
+        };
+      });
+
+      lib = {
+        # The stub overlay. System-agnostic: it picks the entries for whatever
+        # pkgs it is applied to.
+        #
+        #   nixpkgs.overlays = [ (nix-stubs.lib.mkOverlay ./.) ];
+        #
+        # ./. is your flake root — stubs.nix, stubs.lock and flake.lock are read
+        # from it. Any of them can still be given explicitly:
+        #
+        #   (nix-stubs.lib.mkOverlay { root = ./.; inputs = self.inputs; })
+        inherit (lockLib) mkOverlay assertSync read defaultBin;
+      } // forAllSystems ({ pkgs, system, ... }:
         import ./nix/lib.nix {
           inherit pkgs;
-          nix-stubs = self.packages.${pkgs.system}.nix-stubs;
+          nix-stubs = self.packages.${system}.nix-stubs;
         }
       );
+
+      # This repo dogfoods its own lock; see stubs.nix.
+      stubs = forAllSystems ({ pkgs, ... }: import ./stubs.nix { inherit pkgs; });
 
       checks = forAllSystems ({ pkgs, system, ... }: {
         integration = import ./nix/tests/integration.nix {
@@ -32,8 +71,34 @@
           nix-stubs = self.packages.${system}.nix-stubs;
           nixStubsLib = self.lib.${system};
         };
-      });
 
-      homeManagerModules.default = import ./nix/module.nix self;
+        lock = import ./nix/tests/lock.nix {
+          inherit pkgs lockLib;
+          nix-stubs = self.packages.${system}.nix-stubs;
+          root = ./.;
+          stubsNix = ./stubs.nix;
+          stubsLock = ./stubs.lock;
+          flakeLock = ./flake.lock;
+        };
+
+        # Enumerating a stub's closure, the way every image builder does.
+        closure = import ./nix/tests/closure.nix {
+          inherit pkgs lockLib;
+          nix-stubs = self.packages.${system}.nix-stubs;
+          stubsNix = ./stubs.nix;
+          stubsLock = ./stubs.lock;
+          flakeLock = ./flake.lock;
+        };
+
+        # The overlay end-to-end in a booted system, against this repo's own
+        # stubs.nix/stubs.lock.
+        overlay = import ./nix/tests/overlay.nix {
+          inherit pkgs lockLib;
+          nix-stubs = self.packages.${system}.nix-stubs;
+          stubsNix = ./stubs.nix;
+          stubsLock = ./stubs.lock;
+          flakeLock = ./flake.lock;
+        };
+      });
     };
 }

@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "inputs": {
+    "nixpkgs": {
+      "lastModified": 1782467914,
+      "narHash": "sha256-pGvFkM8N0xEkIIXDe5YYfbEAvHrk4IxBrjB/x8OomhE=",
+      "owner": "NixOS",
+      "repo": "nixpkgs",
+      "rev": "e73de5be04e0eff4190a1432b946d469c794e7b4",
+      "type": "github"
+    }
+  },
+  "packages": {
+    "x86_64-linux": {
+      "hello": {
+        "attr": "hello",
+        "drv": "/nix/store/0j6kpwz4dm9964pssxn1zf5vql05y3fl-hello-2.12.3.drv",
+        "output": "out",
+        "bins": [
+          "hello"
+        ],
+        "name": "hello-2.12.3"
+      },
+      "ripgrep": {
+        "attr": "ripgrep",
+        "drv": "/nix/store/0jbhn2chcn27x4yayqnyihg6cvili005-ripgrep-15.1.0.drv",
+        "output": "out",
+        "bins": [
+          "rg"
+        ],
+        "name": "ripgrep-15.1.0"
+      },
+      "tree": {
+        "attr": "tree",
+        "drv": "/nix/store/lin3jp06xrv4k7x2qyvx48l2j2ybn7jy-tree-2.3.2.drv",
+        "output": "out",
+        "bins": [
+          "tree"
+        ],
+        "name": "tree-2.3.2"
+      },
+      "ttyd": {
+        "attr": "ttyd",
+        "drv": "/nix/store/xq9s5rkx2anahn9v7acxyz56wxcb42wz-ttyd-1.7.7.drv",
+        "output": "out",
+        "bins": [
+          "ttyd"
+        ],
+        "name": "ttyd-1.7.7"
+      }
+    }
+  }
+}
