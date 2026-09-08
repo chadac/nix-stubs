@@ -118,6 +118,17 @@ in
       pkg = if nix-stubs != null then nix-stubs else prev.callPackage ./package.nix { };
       mkStub = import ./shim.nix { pkgs = prev; nix-stubs = pkg; };
 
+      # The recipe for the WHOLE set, packed once. Per-stub blobs would each
+      # carry the stdenv bootstrap chain the others already have — a blob is one
+      # opaque file, so the store cannot share it the way it shares .drv paths.
+      recipeDrv = name:
+        builtins.unsafeDiscardOutputDependency (declFor name).package.drvPath;
+
+      sharedRecipe = import ./recipe.nix { pkgs = prev; nix-stubs = pkg; } {
+        name = "stub-set";
+        drvs = map recipeDrv (builtins.attrNames locked);
+      };
+
       # Iterating the LOCK rather than the declarations is what keeps this
       # terminating. The overlay's attribute names have to be known before the
       # package set is complete, and the lock supplies them as plain strings.
@@ -139,7 +150,7 @@ in
             else real.outputName or "out";
         in
         lib.nameValuePair (entry.attr or d.attr) (mkStub {
-          inherit name output;
+          inherit name output sharedRecipe;
           # Carried over so the stub still looks like the package it replaces to
           # everything else in the set — nixpkgs' uv-build reads pkgs.uv.meta.license,
           # and a stub with invented meta breaks that package's eval outright.

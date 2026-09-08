@@ -35,7 +35,7 @@ pkgs.runCommand "nix-stubs-closure-test" { } ''
   fi
 
   echo "--- the recipe travels as an ordinary output instead ---"
-  grep -q -- '-recipe-hello$' ${closure}/store-paths \
+  grep -q -- '-recipe-stub-set' ${closure}/store-paths \
     || { echo "FAIL: no recipe blob in the closure; the tool could never be realised"; exit 1; }
   touch $out
 ''

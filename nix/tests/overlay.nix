@@ -71,8 +71,11 @@ pkgs.testers.runNixOSTest {
     with subtest("the closure carries recipes, not packages"):
         closure = machine.succeed("nix-store -q --requisites /run/current-system").split()
 
-        assert any("-recipe-hello" in p for p in closure), \
-            "MISSING RECIPE: no recipe blob for hello, so it could never be realised"
+        # ONE blob for the set, not one per tool: three stubs are on PATH here
+        # and each would otherwise re-ship the stdenv chain the others carry.
+        recipes = [p for p in closure if "-recipe-" in p]
+        assert recipes, "MISSING RECIPE: no recipe blob, so nothing could be realised"
+        assert len(recipes) == 1, f"expected one shared recipe blob, got {recipes}"
         # The package is present in the VM store (seeded, so the shim can exec it)
         # but must NOT be part of the system — that is the whole point.
         assert "${realHelloOut}" not in closure, \
