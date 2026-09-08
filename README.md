@@ -52,37 +52,36 @@ nix-stubs as an input; `./.` is your flake root, the directory holding
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   inputs.nix-stubs.url = "github:chadac/nix-stubs";      # ← 1. the input
 
-  outputs = { self, nixpkgs, nix-stubs }: {
-    # stubs = … as in step 2
-
-    # In a NixOS system: as a module setting, alongside your other modules.
-    nixosConfigurations.mybox = nixpkgs.lib.nixosSystem {
+  outputs = { self, nixpkgs, nix-stubs }:
+    let
       system = "x86_64-linux";
-      modules = [
-        ./configuration.nix
-        { nixpkgs.overlays = [ (nix-stubs.lib.mkOverlay ./.) ]; }   # ← 2.
-      ];
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ (nix-stubs.lib.mkOverlay ./.) ];    # ← 2. the overlay
+      };
+    in
+    {
+      # stubs = … as in step 2, from nixpkgs.legacyPackages — NOT this `pkgs`.
+      # Declaring a stub set against already-stubbed packages locks the stubs'
+      # own drvs instead of the real ones.
+
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [ pkgs.awscli2 ];                     # `aws` on PATH, lazily
+      };
     };
-  };
 }
 ```
 
-Outside NixOS — a devShell, a package, an image builder — it goes in the
-`import nixpkgs` that produces your `pkgs`:
+That is the whole setup. Every `pkgs.awscli2` from that `pkgs` is now a stub —
+in a devShell, a package, an image builder — and the overlay is system-agnostic,
+so the same call works for whatever system you instantiate.
+
+In a NixOS or home-manager config, where the module system builds `pkgs` for
+you, apply it as a module setting instead of an `import`:
 
 ```nix
-pkgs = import nixpkgs {
-  inherit system;
-  overlays = [ (nix-stubs.lib.mkOverlay ./.) ];
-};
+{ nixpkgs.overlays = [ (nix-stubs.lib.mkOverlay ./.) ]; }
 ```
-
-Either way the overlay is system-agnostic: it picks the lock entries for
-whatever `pkgs` it lands on.
-
-That is the whole setup. `pkgs.awscli2` is now a stub:
-`environment.systemPackages = [ pkgs.awscli2 ]` puts `aws` on PATH without
-putting aws-cli in your image.
 
 ### Stubbing a package from another flake input
 
