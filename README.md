@@ -19,26 +19,66 @@ instead of 449 MB.
 }
 ```
 
-**2. Expose it and generate the lock.** `gen` reads a flake output, so the stub
-set has to be one:
+**2. Expose it as a flake output** — `gen` evaluates `.#stubs.<system>`, so the
+stub set has to be an output named `stubs`, one attribute per system:
 
 ```nix
 # flake.nix
-stubs = forAllSystems (system: import ./stubs.nix {
-  pkgs = nixpkgs.legacyPackages.${system};
-});
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+  outputs = { self, nixpkgs }: {
+    # ← here, a top-level output next to packages/devShells/nixosConfigurations
+    stubs = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-darwin" ] (system:
+      import ./stubs.nix { pkgs = nixpkgs.legacyPackages.${system}; });
+  };
+}
 ```
+
+Nothing here depends on nix-stubs — `gen` is self-contained, so the lock can be
+generated before you add the input:
 
 ```bash
 nix run github:chadac/nix-stubs#gen        # writes ./stubs.lock — commit it
 ```
 
-**3. Apply the overlay.** `./.` is your flake root — the directory holding
+**3. Apply the overlay** wherever you build `pkgs`. This is the step that needs
+nix-stubs as an input; `./.` is your flake root, the directory holding
 `stubs.nix`, `stubs.lock` and `flake.lock`:
 
 ```nix
-overlays = [ (nix-stubs.lib.mkOverlay ./.) ];
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nix-stubs.url = "github:chadac/nix-stubs";      # ← 1. the input
+
+  outputs = { self, nixpkgs, nix-stubs }: {
+    # stubs = … as in step 2
+
+    # In a NixOS system: as a module setting, alongside your other modules.
+    nixosConfigurations.mybox = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        { nixpkgs.overlays = [ (nix-stubs.lib.mkOverlay ./.) ]; }   # ← 2.
+      ];
+    };
+  };
+}
 ```
+
+Outside NixOS — a devShell, a package, an image builder — it goes in the
+`import nixpkgs` that produces your `pkgs`:
+
+```nix
+pkgs = import nixpkgs {
+  inherit system;
+  overlays = [ (nix-stubs.lib.mkOverlay ./.) ];
+};
+```
+
+Either way the overlay is system-agnostic: it picks the lock entries for
+whatever `pkgs` it lands on.
 
 That is the whole setup. `pkgs.awscli2` is now a stub:
 `environment.systemPackages = [ pkgs.awscli2 ]` puts `aws` on PATH without
@@ -56,12 +96,20 @@ signature and pass it through:
 }
 ```
 
-```nix
-overlays = [ (nix-stubs.lib.mkOverlay { root = ./.; inputs = self.inputs; }) ];
-```
+Both call sites have to pass it — `gen` evaluates the step-2 output, the overlay
+evaluates its own copy, and passing `inputs` to only one of them half-works:
 
-The `stubs` flake output from step 2 needs it too, since `gen` evaluates that
-one: `import ./stubs.nix { pkgs = …; inputs = self.inputs; }`.
+```nix
+# flake.nix
+stubs = nixpkgs.lib.genAttrs systems (system: import ./stubs.nix {
+  pkgs = nixpkgs.legacyPackages.${system};
+  inputs = self.inputs;                                        # ← step 2
+});
+
+nixpkgs.overlays = [
+  (nix-stubs.lib.mkOverlay { root = ./.; inputs = self.inputs; })   # ← step 3
+];
+```
 
 ### Overriding the defaults
 
