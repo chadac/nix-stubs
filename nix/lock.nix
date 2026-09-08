@@ -58,6 +58,48 @@ let
 
   defaultBin = pkg: pkg.meta.mainProgram or (builtins.parseDrvName pkg.name).name;
 
+  # A stubs.nix is a function of an attrset. Call it with only the arguments it
+  # declares, so `{ pkgs }:` and `{ pkgs, inputs }:` both work under the path
+  # shorthand without the caller hand-writing a `stubs` lambda.
+  callStubs = file: extra: pkgs:
+    let
+      f = import file;
+      avail = { inherit pkgs; } // extra;
+    in
+    if builtins.isFunction f
+    then f (builtins.intersectAttrs (builtins.functionArgs f) avail)
+    else throw ''
+      nix-stubs: ${toString file} must be a function of an attrset, e.g.
+      `{ pkgs }: { hello = pkgs.hello; }`.
+    '';
+
+  # `mkOverlay ./.` == `mkOverlay { root = ./.; }`. A flake root already fixes
+  # where all three files live, so requiring them spelled out was boilerplate
+  # with exactly one correct answer. Anything passed explicitly still wins, and
+  # `root` is only forced by the defaults that need it — so the explicit form
+  # never has to supply it.
+  overlayArgs = arg:
+    let
+      args = if builtins.isAttrs arg then arg else { root = arg; };
+      root = args.root or null;
+      inRoot = attr: file:
+        if root != null then root + file else throw ''
+          nix-stubs: mkOverlay needs '${attr}'. Pass it, or pass `root` — your
+          flake directory, usually ./. — and it defaults to ${file} in there.
+        '';
+      # `inputs` is the one extra argument a stubs.nix conventionally takes (to
+      # reach a package from another flake input). Anything beyond that wants
+      # the explicit `stubs` lambda rather than more magic here.
+      extra = lib.optionalAttrs (args ? inputs) { inherit (args) inputs; };
+    in
+    {
+      stubs = args.stubs or (callStubs (inRoot "stubs" "/stubs.nix") extra);
+      lock = args.lock or (inRoot "lock" "/stubs.lock");
+      flakeLock = args.flakeLock or (inRoot "flakeLock" "/flake.lock");
+      lockPath = args.lockPath or "stubs.lock";
+      nix-stubs = args.nix-stubs or null;
+    };
+
   normalize = name: decl:
     if lib.isDerivation decl
     then { package = decl; attr = name; bins = null; output = null; }
@@ -86,16 +128,18 @@ in
   # evaluation; it records what the evaluation is expected to produce, and
   # `nix-stubs check` enforces that in CI.
   #
+  # Takes your flake root — `mkOverlay ./.` — or an attrset:
+  #
+  #   root       ./. — defaults stubs to ./stubs.nix, lock to ./stubs.lock and
+  #              flakeLock to ./flake.lock inside it
   #   stubs      pkgs -> attrset of declarations (usually `import ./stubs.nix`)
   #   lock       ./stubs.lock — supplies discovered bins/output, and the pins
   #   flakeLock  ./flake.lock — the lock must still agree with it
-  mkOverlay =
-    { stubs
-    , lock
-    , flakeLock
-    , lockPath ? "stubs.lock"
-    , nix-stubs ? null
-    }:
+  #   inputs     passed to ./stubs.nix if it declares that argument
+  mkOverlay = arg:
+    let
+      inherit (overlayArgs arg) stubs lock flakeLock lockPath nix-stubs;
+    in
     final: prev:
     let
       lock' = asAttrs lock;

@@ -48,13 +48,12 @@
         # The stub overlay. System-agnostic: it picks the entries for whatever
         # pkgs it is applied to.
         #
-        #   nixpkgs.overlays = [
-        #     (nix-stubs.lib.mkOverlay {
-        #       stubs = pkgs: import ./stubs.nix { inherit pkgs; };
-        #       lock = ./stubs.lock;
-        #       flakeLock = ./flake.lock;
-        #     })
-        #   ];
+        #   nixpkgs.overlays = [ (nix-stubs.lib.mkOverlay ./.) ];
+        #
+        # ./. is your flake root — stubs.nix, stubs.lock and flake.lock are read
+        # from it. Any of them can still be given explicitly:
+        #
+        #   (nix-stubs.lib.mkOverlay { root = ./.; inputs = self.inputs; })
         inherit (lockLib) mkOverlay assertSync read defaultBin;
       } // forAllSystems ({ pkgs, system, ... }:
         import ./nix/lib.nix {
@@ -76,6 +75,7 @@
         lock = import ./nix/tests/lock.nix {
           inherit pkgs lockLib;
           nix-stubs = self.packages.${system}.nix-stubs;
+          root = ./.;
           stubsNix = ./stubs.nix;
           stubsLock = ./stubs.lock;
           flakeLock = ./flake.lock;

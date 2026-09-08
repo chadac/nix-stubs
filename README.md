@@ -17,11 +17,21 @@ instead of 449 MB.
 ```
 
 ```nix
-# apply the generated lock as an overlay
+# apply the generated lock as an overlay — ./. is your flake root
+overlays = [ (nix-stubs.lib.mkOverlay ./.) ];
+```
+
+`stubs.nix`, `stubs.lock` and `flake.lock` are read from that directory, and
+`stubs.nix` is called with the arguments it declares — `{ pkgs }` or
+`{ pkgs, inputs }`, the latter if you pass `inputs`. Override any of it:
+
+```nix
 overlays = [
   (nix-stubs.lib.mkOverlay {
-    stubs = pkgs: import ./stubs.nix { inherit pkgs; inputs = self.inputs; };
-    lock = ./stubs.lock;
+    root = ./.;                 # optional once everything below is explicit
+    inputs = self.inputs;       # -> stubs.nix's `inputs` argument
+    stubs = pkgs: import ./nix/stubs.nix { inherit pkgs; };
+    lock = ./nix/stubs.lock;
     flakeLock = ./flake.lock;
   })
 ];

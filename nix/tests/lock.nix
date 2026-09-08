@@ -1,4 +1,4 @@
-{ pkgs, nix-stubs, lockLib, stubsNix, stubsLock, flakeLock }:
+{ pkgs, nix-stubs, lockLib, root, stubsNix, stubsLock, flakeLock }:
 
 # Eval-level properties of the overlay, against THIS repo's real stubs.nix,
 # stubs.lock and flake.lock. Runtime behaviour is in ./integration.nix and
@@ -24,6 +24,11 @@ let
   };
 
   stubbed = pkgs.extend overlay;
+
+  # The path shorthand must build the SAME stubs, not merely evaluate: it is the
+  # documented way to call this, so a default that resolved to a different
+  # stubs.nix/lock would be a silent downgrade for every consumer.
+  rootStubbed = pkgs.extend (lockLib.mkOverlay { inherit root nix-stubs; });
 
   # A flake.lock that moved without a relock. Derived from the real one so it
   # cannot drift from it, and so the assertion below is about the real pins.
@@ -64,6 +69,17 @@ assert lib.assertMsg (drvDrift == [ ])
 
 assert lib.assertMsg (!stale.success)
   "a stubs.lock whose inputs disagree with flake.lock must throw, not silently build stale stubs";
+
+assert
+  let
+    names = lib.attrNames (overlay pkgs pkgs);
+    rootNames = lib.attrNames (lockLib.mkOverlay { inherit root nix-stubs; } pkgs pkgs);
+  in
+  lib.assertMsg (names == rootNames)
+    "mkOverlay { root = ./.; } must stub the same attributes as the explicit form";
+
+assert lib.assertMsg (rootStubbed.hello.outPath == stubbed.hello.outPath)
+  "mkOverlay { root = ./.; } must produce the same stub as the explicit form";
 
 assert lib.assertMsg (stubbed.hello.passthru.real == pkgs.hello)
   "passthru.real must be the package the stub stands in for";
