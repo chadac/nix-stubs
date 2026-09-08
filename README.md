@@ -7,38 +7,76 @@ A stub ships the package's **build recipe** instead of the package. Typing `aws`
 realises the real aws-cli and execs it; until you do, your image carries 8.4 MB
 instead of 449 MB.
 
+## Quickstart
+
+**1. Say what to make lazy** — `stubs.nix`, at your flake root:
+
 ```nix
-# stubs.nix — what to make lazy
-{ pkgs, inputs }: {
+{ pkgs }: {
   awscli2 = pkgs.awscli2;
   code-server = pkgs.code-server;
+  ripgrep = { package = pkgs.ripgrep; bins = [ "rg" ]; };
+}
+```
+
+**2. Expose it and generate the lock.** `gen` reads a flake output, so the stub
+set has to be one:
+
+```nix
+# flake.nix
+stubs = forAllSystems (system: import ./stubs.nix {
+  pkgs = nixpkgs.legacyPackages.${system};
+});
+```
+
+```bash
+nix run github:chadac/nix-stubs#gen        # writes ./stubs.lock — commit it
+```
+
+**3. Apply the overlay.** `./.` is your flake root — the directory holding
+`stubs.nix`, `stubs.lock` and `flake.lock`:
+
+```nix
+overlays = [ (nix-stubs.lib.mkOverlay ./.) ];
+```
+
+That is the whole setup. `pkgs.awscli2` is now a stub:
+`environment.systemPackages = [ pkgs.awscli2 ]` puts `aws` on PATH without
+putting aws-cli in your image.
+
+### Stubbing a package from another flake input
+
+`stubs.nix` is called with the arguments it *declares*, so add `inputs` to its
+signature and pass it through:
+
+```nix
+# stubs.nix
+{ pkgs, inputs }: {
   uv = { package = inputs.uv-nix.packages.${pkgs.system}.uv; bins = [ "uv" "uvx" ]; };
 }
 ```
 
 ```nix
-# apply the generated lock as an overlay — ./. is your flake root
-overlays = [ (nix-stubs.lib.mkOverlay ./.) ];
+overlays = [ (nix-stubs.lib.mkOverlay { root = ./.; inputs = self.inputs; }) ];
 ```
 
-`stubs.nix`, `stubs.lock` and `flake.lock` are read from that directory, and
-`stubs.nix` is called with the arguments it declares — `{ pkgs }` or
-`{ pkgs, inputs }`, the latter if you pass `inputs`. Override any of it:
+The `stubs` flake output from step 2 needs it too, since `gen` evaluates that
+one: `import ./stubs.nix { pkgs = …; inputs = self.inputs; }`.
+
+### Overriding the defaults
+
+Any field given explicitly wins over what `root` would have supplied, and once
+all three are explicit `root` is unnecessary:
 
 ```nix
 overlays = [
   (nix-stubs.lib.mkOverlay {
-    root = ./.;                 # optional once everything below is explicit
-    inputs = self.inputs;       # -> stubs.nix's `inputs` argument
     stubs = pkgs: import ./nix/stubs.nix { inherit pkgs; };
     lock = ./nix/stubs.lock;
     flakeLock = ./flake.lock;
   })
 ];
 ```
-
-`pkgs.awscli2` is now a stub. `environment.systemPackages = [ pkgs.awscli2 ]`
-puts `aws` on PATH without putting aws-cli in your image.
 
 ## Why the recipe
 
@@ -104,15 +142,8 @@ An entry is a package, or an attrset:
 | `output` | the package's `outputName` | which output to exec from |
 | `attr` | the entry name | nixpkgs attribute to replace |
 
-Expose it from your flake so `gen` can find it:
-
-```nix
-# flake.nix
-stubs = forAllSystems (system: import ./stubs.nix {
-  pkgs = nixpkgs.legacyPackages.${system};
-  inputs = self.inputs;
-});
-```
+It must be a flake output for `gen` to read it (quickstart step 2); `--attr`
+selects a different one.
 
 ## `stubs.lock`
 
