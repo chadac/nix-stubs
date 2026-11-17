@@ -72,30 +72,62 @@ impl Lock {
 ///
 /// Recorded verbatim so the sync check is an exact comparison: any change to
 /// how that input is pinned trips it, not just a rev bump.
+/// A `follows` input pins the node it points at.
 pub fn locked_input(
     flake_lock: &serde_json::Value,
     name: &str,
 ) -> Result<serde_json::Value, String> {
-    let root_name = flake_lock
+    let root = flake_lock
         .get("root")
         .and_then(|v| v.as_str())
         .ok_or("flake.lock: no root node")?;
     let nodes = flake_lock.get("nodes").ok_or("flake.lock: no nodes")?;
-    let reference = nodes
-        .get(root_name)
-        .and_then(|n| n.get("inputs"))
-        .and_then(|i| i.get(name))
-        .ok_or_else(|| format!("flake.lock: '{name}' is not an input of this flake"))?;
-
-    let node_name = reference.as_str().ok_or_else(|| {
-        format!("flake.lock: input '{name}' is a 'follows' input, which stubs.lock cannot pin")
-    })?;
+    let reference = input_of(nodes, root, name)
+        .map_err(|_| format!("flake.lock: '{name}' is not an input of this flake"))?;
+    let node_name = resolve(nodes, root, reference, 0)
+        .map_err(|e| format!("flake.lock: input '{name}': {e}"))?;
 
     nodes
-        .get(node_name)
+        .get(&node_name)
         .and_then(|n| n.get("locked"))
         .cloned()
         .ok_or_else(|| format!("flake.lock: node '{node_name}' has no 'locked' entry"))
+}
+
+fn input_of<'a>(
+    nodes: &'a serde_json::Value,
+    node: &str,
+    input: &str,
+) -> Result<&'a serde_json::Value, String> {
+    nodes
+        .get(node)
+        .and_then(|n| n.get("inputs"))
+        .and_then(|i| i.get(input))
+        .ok_or_else(|| format!("'{input}' is not an input of '{node}'"))
+}
+
+/// A node name, or a `follows` path walked from the root to a node name.
+fn resolve(
+    nodes: &serde_json::Value,
+    root: &str,
+    reference: &serde_json::Value,
+    depth: usize,
+) -> Result<String, String> {
+    if depth > 64 {
+        return Err("its follows paths form a cycle".to_string());
+    }
+    match reference {
+        serde_json::Value::String(node) => Ok(node.clone()),
+        serde_json::Value::Array(path) => {
+            let mut node = root.to_string();
+            for step in path {
+                let step = step.as_str().ok_or("malformed follows path")?;
+                node = resolve(nodes, root, input_of(nodes, &node, step)?, depth + 1)?;
+            }
+            Ok(node)
+        }
+        _ => Err("malformed input reference".to_string()),
+    }
 }
 
 pub fn describe_input(locked: &serde_json::Value) -> String {
@@ -131,4 +163,53 @@ pub fn sync_errors(lock: &Lock, flake_lock: &serde_json::Value) -> Vec<String> {
 pub fn read_flake_lock(path: &str) -> Result<serde_json::Value, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     serde_json::from_str(&s).map_err(|e| format!("{path}: not valid JSON: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn flake_lock() -> serde_json::Value {
+        json!({
+            "root": "root",
+            "nodes": {
+                "root": { "inputs": { "scooter": "scooter", "nixpkgs": ["scooter", "nixpkgs"] } },
+                "scooter": {
+                    "inputs": { "nixpkgs": "nixpkgs", "pinned": ["scooter", "nixpkgs"] },
+                    "locked": { "type": "github", "rev": "s" }
+                },
+                "nixpkgs": { "locked": { "type": "github", "rev": "n" } }
+            }
+        })
+    }
+
+    #[test]
+    fn direct_input() {
+        assert_eq!(locked_input(&flake_lock(), "scooter").unwrap()["rev"], "s");
+    }
+
+    #[test]
+    fn follows_input_pins_its_target() {
+        assert_eq!(locked_input(&flake_lock(), "nixpkgs").unwrap()["rev"], "n");
+    }
+
+    #[test]
+    fn follows_through_follows() {
+        let mut l = flake_lock();
+        l["nodes"]["root"]["inputs"]["nixpkgs"] = json!(["scooter", "pinned"]);
+        assert_eq!(locked_input(&l, "nixpkgs").unwrap()["rev"], "n");
+    }
+
+    #[test]
+    fn follows_cycle_is_an_error() {
+        let mut l = flake_lock();
+        l["nodes"]["root"]["inputs"]["nixpkgs"] = json!(["nixpkgs"]);
+        assert!(locked_input(&l, "nixpkgs").unwrap_err().contains("cycle"));
+    }
+
+    #[test]
+    fn missing_input() {
+        assert!(locked_input(&flake_lock(), "nope").is_err());
+    }
 }
