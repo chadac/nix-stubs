@@ -60,6 +60,34 @@ let
     entries;
   drvDrift = lib.filter (e: e != null) drvMatches;
 
+  # The real lock split in two, to compose real drvs.
+  part = names: lock // {
+    packages = lib.mapAttrs (_: lib.filterAttrs (n: _: builtins.elem n names)) lock.packages;
+  };
+  setOf = l: fl: { stubs = p: import stubsNix { pkgs = p; }; lock = l; flakeLock = fl; };
+  compose = sets: lockLib.mkOverlay { inherit sets nix-stubs; };
+  throws = o: !(builtins.tryEval (builtins.attrNames (o pkgs pkgs))).success;
+
+  composed = compose {
+    a = setOf (part [ "hello" "tree" ]) flakeLock;
+    b = setOf (part [ "ripgrep" "ttyd" ]) flakeLock;
+  };
+  composedPkgs = pkgs.extend composed;
+
+  # In sync with its own flake.lock, but not with set a.
+  movedLock = lib.recursiveUpdate (part [ "ripgrep" ]) {
+    inputs.nixpkgs.rev = "0000000000000000000000000000000000000000";
+  };
+
+  # nixpkgs follows another flake's, like `scooter/nixpkgs`.
+  followsFlakeLock =
+    let real = lockLib.read flakeLock;
+    in lib.recursiveUpdate real {
+      nodes.root.inputs.nixpkgs = [ "upstream" "nixpkgs" ];
+      nodes.root.inputs.upstream = "upstream";
+      nodes.upstream = { inputs.nixpkgs = "nixpkgs"; locked = { type = "github"; owner = "x"; repo = "upstream"; rev = "1"; }; };
+    };
+
   helloOut = builtins.unsafeDiscardStringContext (toString pkgs.hello);
   helloDrv = builtins.unsafeDiscardStringContext pkgs.hello.drvPath;
 in
@@ -109,6 +137,34 @@ assert
   let ctx = builtins.getContext (builtins.unsafeDiscardOutputDependency pkgs.hello.drvPath);
   in lib.assertMsg (!(ctx.${helloDrv}.allOutputs or false))
     "the stub must not depend on the package's OUTPUTS — that is what it exists to avoid shipping";
+
+assert lib.assertMsg (lib.attrNames (composed pkgs pkgs) == lib.attrNames (overlay pkgs pkgs))
+  "composing the set from two halves must stub the same attributes";
+
+# Splitting the set must not change any stub.
+assert lib.assertMsg (composedPkgs.hello.outPath == stubbed.hello.outPath
+  && composedPkgs.ripgrep.outPath == stubbed.ripgrep.outPath)
+  "composed sets must share one recipe, identical to the unsplit set's";
+
+assert lib.assertMsg (throws (compose {
+  a = setOf (part [ "hello" "tree" ]) flakeLock;
+  b = setOf (part [ "hello" ]) flakeLock;
+}))
+  "two sets stubbing the same attribute must throw";
+
+assert lib.assertMsg (throws (compose {
+  a = setOf (part [ "hello" ]) flakeLock;
+  b = setOf movedLock movedFlakeLock;
+}))
+  "two sets pinning the same input differently must throw";
+
+assert lib.assertMsg (lib.attrNames (lockLib.mkOverlay {
+  stubs = p: import stubsNix { pkgs = p; };
+  lock = stubsLock;
+  flakeLock = followsFlakeLock;
+  inherit nix-stubs;
+} pkgs pkgs) == lib.attrNames (overlay pkgs pkgs))
+  "a nixpkgs input that follows another flake's must sync against the node it follows";
 
 pkgs.runCommand "nix-stubs-lock-test" { } ''
   shim=${stubbed.hello}/bin/hello

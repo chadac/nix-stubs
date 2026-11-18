@@ -125,6 +125,54 @@ overlays = [
 ];
 ```
 
+### Several stub sets
+
+A project with parts owned by different people (plugins, teams, customers) can
+give each part its own `stubs.nix` and `stubs.lock` and compose them into one
+overlay:
+
+```nix
+overlays = [
+  (nix-stubs.lib.mkOverlay {
+    sets = {
+      base = ./.;                                        # any single-set form
+      aws  = { root = ./plugins/aws; flakeLock = ./flake.lock; };
+      acme = { root = acme.outPath; inputs = acme.inputs; };  # its own flake.lock
+    };
+  })
+];
+```
+
+One overlay rather than one per set: the sets share a single recipe blob (a
+blob per set would re-ship the stdenv chain each time), and no set sees another
+set's stubs in `prev`. Two rules hold across sets, and break the build with an
+error naming the sets:
+
+- two sets may not stub the same attribute;
+- an input two sets both pin (normally `nixpkgs`) must be pinned the same way,
+  since every stub is built from the one package set the overlay is applied to.
+
+A set from another flake usually says `nixpkgs.follows = "you/nixpkgs"`, and its
+lock pins the node that `follows` points at.
+
+`gen` and `check` cover every set when the flake has a `stubSets` output in
+place of `stubs`. `lock` and `flakeLock` are paths relative to the flake, as
+strings:
+
+```nix
+stubSets = {
+  base = { lock = "stubs.lock"; stubs = forAllSystems (pkgs: import ./stubs.nix { inherit pkgs; }); };
+  aws  = { lock = "plugins/aws/stubs.lock"; flakeLock = "flake.lock";
+           stubs = forAllSystems (pkgs: import ./plugins/aws/stubs.nix { inherit pkgs; }); };
+};
+```
+
+```bash
+nix run github:chadac/nix-stubs#gen                 # every set
+nix run github:chadac/nix-stubs#gen -- --set aws    # one (repeatable)
+nix run github:chadac/nix-stubs#check -- --fast     # every set
+```
+
 ## Why the recipe
 
 A `.drv` is a complete, self-contained build recipe — builder, args, env,
@@ -213,7 +261,9 @@ evaluates `stubs.nix` for the drv, and the lock's job is to pin the inputs, carr
 | flag | default | |
 |---|---|---|
 | `--flake` | `.` | flake holding the stub set |
-| `--attr` | `stubs` | flake output to read |
+| `--attr` | `stubSets` if the flake has it, else `stubs` | flake output to read; given, it means one set |
+| `--set` | every set | with `stubSets`, only this set (repeatable) |
+| `--lock` / `--flake-lock` | `stubs.lock` / `flake.lock` | for one set; `stubSets` names its own |
 | `--system` | current | repeatable; other systems in the lock are preserved |
 | `--input` | those already locked, else `nixpkgs` | flake inputs to pin |
 | `--discover-bins` | off | build each package and enumerate `$out/bin` instead of trusting `stubs.nix`. Off by default so a relock never builds anything. |

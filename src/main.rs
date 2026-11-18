@@ -61,27 +61,31 @@ enum Commands {
         roots: Vec<String>,
     },
 
-    /// Generate stubs.lock from a flake's stub set
+    /// Generate stubs.lock from a flake's stub set, or every set in `stubSets`
     Gen {
         /// Flake containing the stub set
         #[arg(long, default_value = ".")]
         flake: String,
 
-        /// Flake output attribute holding the stub set
-        #[arg(long, default_value = "stubs")]
-        attr: String,
+        /// Flake output attribute holding one stub set [default: stubSets if the flake has it, else stubs]
+        #[arg(long)]
+        attr: Option<String>,
+
+        /// Only this set of the flake's `stubSets` (repeatable)
+        #[arg(long = "set", conflicts_with_all = ["attr", "lock", "flake_lock"])]
+        sets: Vec<String>,
 
         /// Systems to lock (repeatable; defaults to the current system)
         #[arg(long = "system")]
         systems: Vec<String>,
 
-        /// Path to stubs.lock
-        #[arg(long, default_value = "stubs.lock")]
-        lock: String,
+        /// Path to stubs.lock, for a single set
+        #[arg(long)]
+        lock: Option<String>,
 
-        /// Path to the flake.lock stubs.lock is synced to
-        #[arg(long = "flake-lock", default_value = "flake.lock")]
-        flake_lock: String,
+        /// Path to the flake.lock stubs.lock is synced to, for a single set
+        #[arg(long = "flake-lock")]
+        flake_lock: Option<String>,
 
         /// Flake inputs to pin (repeatable; defaults to those already locked, else nixpkgs)
         #[arg(long = "input")]
@@ -92,19 +96,22 @@ enum Commands {
         discover_bins: bool,
     },
 
-    /// Verify stubs.lock is in sync with flake.lock and stubs.nix (CI check)
+    /// Verify each stubs.lock is in sync with flake.lock and stubs.nix (CI check)
     Check {
         #[arg(long, default_value = ".")]
         flake: String,
 
-        #[arg(long, default_value = "stubs")]
-        attr: String,
+        #[arg(long)]
+        attr: Option<String>,
 
-        #[arg(long, default_value = "stubs.lock")]
-        lock: String,
+        #[arg(long = "set", conflicts_with_all = ["attr", "lock", "flake_lock"])]
+        sets: Vec<String>,
 
-        #[arg(long = "flake-lock", default_value = "flake.lock")]
-        flake_lock: String,
+        #[arg(long)]
+        lock: Option<String>,
+
+        #[arg(long = "flake-lock")]
+        flake_lock: Option<String>,
 
         /// Only compare inputs against flake.lock; skip re-evaluating stubs.nix
         #[arg(long)]
@@ -332,12 +339,73 @@ fn cmd_exec(
     std::process::exit(1);
 }
 
-fn gen_opts(
-    flake: String,
+/// One lock to generate or check.
+struct Target {
+    /// The `stubSets` name, or None for a lone stub set.
+    set: Option<String>,
     attr: String,
+    lock: String,
+    flake_lock: String,
+}
+
+/// The locks to cover; `--attr` or `--lock` means one set.
+fn targets(
+    flake: &str,
+    attr: Option<String>,
+    sets: Vec<String>,
+    lock: Option<String>,
+    flake_lock: Option<String>,
+) -> Result<Vec<Target>, String> {
+    let single = |attr: Option<String>| Target {
+        set: None,
+        attr: attr.unwrap_or_else(|| "stubs".to_string()),
+        lock: lock.clone().unwrap_or_else(|| "stubs.lock".to_string()),
+        flake_lock: flake_lock
+            .clone()
+            .unwrap_or_else(|| "flake.lock".to_string()),
+    };
+    if attr.is_some() || lock.is_some() || flake_lock.is_some() {
+        return Ok(vec![single(attr)]);
+    }
+
+    let Some(all) = gen::stub_sets(flake)? else {
+        if !sets.is_empty() {
+            return Err(format!(
+                "{flake} has no `stubSets` output, so --set has nothing to pick from"
+            ));
+        }
+        return Ok(vec![single(None)]);
+    };
+
+    if let Some(unknown) = sets.iter().find(|s| !all.contains_key(*s)) {
+        let known: Vec<&str> = all.keys().map(String::as_str).collect();
+        return Err(format!(
+            "{flake} has no stub set '{unknown}' (it has: {})",
+            known.join(", ")
+        ));
+    }
+
+    // Relative to the flake: cwd, unless --flake names a directory.
+    let rel = |p: &str| match Path::new(flake) {
+        dir if flake != "." && dir.is_dir() => dir.join(p).to_string_lossy().to_string(),
+        _ => p.to_string(),
+    };
+    Ok(all
+        .into_iter()
+        .filter(|(name, _)| sets.is_empty() || sets.contains(name))
+        .map(|(name, spec)| Target {
+            attr: format!("stubSets.\"{name}\".stubs"),
+            lock: rel(&spec.lock),
+            flake_lock: rel(&spec.flake_lock),
+            set: Some(name),
+        })
+        .collect())
+}
+
+fn gen_opts(
+    flake: &str,
+    target: &Target,
     systems: Vec<String>,
-    lock_path: String,
-    flake_lock_path: String,
     inputs: Vec<String>,
     discover_bins: bool,
 ) -> GenOpts {
@@ -346,20 +414,54 @@ fn gen_opts(
     let inputs = if !inputs.is_empty() {
         inputs
     } else {
-        match lock::Lock::read(&lock_path) {
+        match lock::Lock::read(&target.lock) {
             Ok(l) if !l.inputs.is_empty() => l.inputs.keys().cloned().collect(),
             _ => vec!["nixpkgs".to_string()],
         }
     };
     GenOpts {
-        flake,
-        attr,
+        flake: flake.to_string(),
+        attr: target.attr.clone(),
         systems,
-        lock_path,
-        flake_lock_path,
+        lock_path: target.lock.clone(),
+        flake_lock_path: target.flake_lock.clone(),
         inputs,
         discover_bins,
     }
+}
+
+/// Runs `each` per target; exits 1 if any failed.
+fn run_all(targets: Vec<Target>, each: impl Fn(&Target) -> Result<String, String>) {
+    let mut failed = false;
+    for t in &targets {
+        let prefix = match &t.set {
+            Some(s) => format!("nix-stubs: [{s}]"),
+            None => "nix-stubs:".to_string(),
+        };
+        match each(t) {
+            Ok(msg) => println!("{prefix} {msg}"),
+            Err(e) => {
+                eprintln!("{prefix} {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+fn targets_or_die(
+    flake: &str,
+    attr: Option<String>,
+    sets: Vec<String>,
+    lock: Option<String>,
+    flake_lock: Option<String>,
+) -> Vec<Target> {
+    targets(flake, attr, sets, lock, flake_lock).unwrap_or_else(|e| {
+        eprintln!("nix-stubs: {e}");
+        std::process::exit(1)
+    })
 }
 
 fn main() {
@@ -379,29 +481,30 @@ fn main() {
         Commands::Gen {
             flake,
             attr,
+            sets,
             systems,
             lock,
             flake_lock,
             inputs,
             discover_bins,
-        } => gen::cmd_gen(gen_opts(
-            flake,
-            attr,
-            systems,
-            lock,
-            flake_lock,
-            inputs,
-            discover_bins,
-        )),
+        } => run_all(targets_or_die(&flake, attr, sets, lock, flake_lock), |t| {
+            gen::gen(&gen_opts(
+                &flake,
+                t,
+                systems.clone(),
+                inputs.clone(),
+                discover_bins,
+            ))
+        }),
         Commands::Check {
             flake,
             attr,
+            sets,
             lock,
             flake_lock,
             fast,
-        } => gen::cmd_check(
-            gen_opts(flake, attr, vec![], lock, flake_lock, vec![], false),
-            fast,
-        ),
+        } => run_all(targets_or_die(&flake, attr, sets, lock, flake_lock), |t| {
+            gen::check(gen_opts(&flake, t, vec![], vec![], false), fast)
+        }),
     }
 }

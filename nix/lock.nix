@@ -8,22 +8,24 @@ let
   asAttrs = v: if builtins.isAttrs v && !(lib.isDerivation v) then v else readJSON v;
 
   # Resolve a root-level input of a flake.lock to its `locked` node.
-  # flake.lock nodes reference each other by name; a root input is either a node
-  # name (a string) or a "follows" path (a list), which we don't resolve.
+  # An input is a node name, or a `follows` path from root.
   lockedInput = flakeLock: name:
     let
-      root = flakeLock.nodes.${flakeLock.root};
+      nodes = flakeLock.nodes;
+      inputOf = node: input: nodes.${node}.inputs.${input} or (throw ''
+        nix-stubs: input '${name}' follows '${input}' of '${node}', which
+        flake.lock does not have. Run `nix flake lock`.
+      '');
+      resolve = ref:
+        if builtins.isString ref then ref
+        else lib.foldl' (node: input: resolve (inputOf node input)) flakeLock.root ref;
+      root = nodes.${flakeLock.root};
       ref = root.inputs.${name} or (throw ''
         nix-stubs: input '${name}' is recorded in stubs.lock but is not an input
         of this flake. Either add it to flake.nix or regenerate stubs.lock.
       '');
     in
-    if builtins.isString ref
-    then flakeLock.nodes.${ref}.locked
-    else throw ''
-      nix-stubs: input '${name}' is a 'follows' input, which stubs.lock cannot
-      pin. Depend on it directly, or drop it from the locked input set.
-    '';
+    nodes.${resolve ref}.locked;
 
   fmtInput = l:
     let rev = l.rev or l.narHash or "?";
@@ -110,13 +112,59 @@ let
       output = decl.output or null;
     };
 
+  # mkOverlay's sets by name; a lone set is `default`.
+  setsOf = arg:
+    if builtins.isAttrs arg && arg ? sets
+    then lib.mapAttrs (_: overlayArgs) arg.sets
+    else { default = overlayArgs arg; };
+
+  # Error label: names the set once there are several.
+  labelFor = multi: name: lockPath:
+    if multi then "set '${name}' (${lockPath})" else lockPath;
+
+  # Attributes that more than one set stubs.
+  duplicateErrors = sets:
+    let
+      owners = lib.foldlAttrs
+        (acc: set: s:
+          lib.foldlAttrs
+            (acc': name: entry:
+              let attr = entry.attr or name;
+              in acc' // { ${attr} = (acc'.${attr} or [ ]) ++ [ set ]; })
+            acc
+            s.locked)
+        { }
+        sets;
+    in
+    lib.mapAttrsToList (attr: from: "'${attr}' is stubbed by ${lib.concatMapStringsSep " and " (s: "'${s}'") from}")
+      (lib.filterAttrs (_: from: builtins.length from > 1) owners);
+
+  # Inputs two sets pin differently; every stub builds from one nixpkgs.
+  inputErrors = sets:
+    let
+      pins = lib.foldlAttrs
+        (acc: set: s:
+          lib.foldlAttrs
+            (acc': input: pinned: acc' // { ${input} = (acc'.${input} or [ ]) ++ [ { inherit set pinned; } ]; })
+            acc
+            s.lock.inputs)
+        { }
+        sets;
+      disagree = lib.filterAttrs (_: ps: lib.any (p: p.pinned != (builtins.head ps).pinned) ps) pins;
+    in
+    lib.mapAttrsToList
+      (input: ps: ''
+        input '${input}'
+            ${lib.concatMapStringsSep "\n    " (p: "${p.set}  ${fmtInput p.pinned}") ps}'')
+      disagree;
+
 in
 {
   inherit lockedInput syncErrors assertSync defaultBin;
 
   read = asAttrs;
 
-  # Turn a stub set into a nixpkgs overlay, replacing each declared attribute
+  # Turn stub sets into a nixpkgs overlay, replacing each declared attribute
   # with a stub that carries the package's RECIPE and not the package.
   #
   # The drv comes from evaluating the package, not from stubs.lock. A drv path
@@ -136,41 +184,81 @@ in
   #   lock       ./stubs.lock — supplies discovered bins/output, and the pins
   #   flakeLock  ./flake.lock — the lock must still agree with it
   #   inputs     passed to ./stubs.nix if it declares that argument
+  #
+  # Or several sets composed into one overlay, each in either form above:
+  #
+  #   mkOverlay { sets = { base = ./.; aws = { root = ./aws; flakeLock = ./flake.lock; }; }; }
+  #
+  # Sets share one recipe blob and never see each other's stubs.
   mkOverlay = arg:
     let
-      inherit (overlayArgs arg) stubs lock flakeLock lockPath nix-stubs;
+      sets = setsOf arg;
+      multi = builtins.isAttrs arg && arg ? sets;
+      nix-stubs = if builtins.isAttrs arg then arg.nix-stubs or null else null;
     in
     final: prev:
     let
-      lock' = asAttrs lock;
-      flakeLock' = asAttrs flakeLock;
-      synced = assertSync { lock = lock'; flakeLock = flakeLock'; inherit lockPath; };
-
       system = prev.stdenv.hostPlatform.system;
-      locked = lock'.packages.${system} or (throw "nix-stubs: ${lockPath} has no packages for system ${system}");
 
-      # `prev`, not `final`: a stub set that reached for the stubbed attributes
-      # would be its own input.
-      decls = stubs prev;
+      loaded = lib.mapAttrs
+        (setName: s:
+          let
+            label = labelFor multi setName s.lockPath;
+            lock = asAttrs s.lock;
+          in
+          {
+            inherit label lock;
+            synced = assertSync { inherit lock; flakeLock = asAttrs s.flakeLock; lockPath = label; };
+            locked = lock.packages.${system} or (throw "nix-stubs: ${label} has no packages for system ${system}");
+            # `prev`, not `final`: a stub set that reached for the stubbed
+            # attributes would be its own input.
+            decls = s.stubs prev;
+          })
+        sets;
 
-      declFor = name:
-        normalize name (decls.${name} or (throw ''
-          nix-stubs: ${lockPath} has an entry for '${name}', but stubs.nix does
-          not declare it. Regenerate the lock: nix run github:chadac/nix-stubs#gen
+      dupErrs = duplicateErrors loaded;
+      noDuplicates = dupErrs == [ ] || throw ''
+
+        nix-stubs: two stub sets replace the same attribute
+
+          ${lib.concatStringsSep "\n  " dupErrs}
+
+        Keep each attribute in one set.
+      '';
+
+      inputErrs = inputErrors loaded;
+      inputsAgree = inputErrs == [ ] || throw ''
+
+        nix-stubs: stub sets were locked against different inputs
+
+          ${lib.concatStringsSep "\n\n  " inputErrs}
+
+        Relock them against the same flake.lock pins.
+      '';
+
+      ok = lib.all (s: s.synced) (lib.attrValues loaded) && noDuplicates && inputsAgree;
+
+      declFor = s: name:
+        normalize name (s.decls.${name} or (throw ''
+          nix-stubs: ${s.label} has an entry for '${name}', but its stubs.nix
+          does not declare it. Regenerate the lock: nix run github:chadac/nix-stubs#gen
         ''));
 
       pkg = if nix-stubs != null then nix-stubs else prev.callPackage ./package.nix { };
       mkStub = import ./shim.nix { pkgs = prev; nix-stubs = pkg; };
 
-      # The recipe for the WHOLE set, packed once. Per-stub blobs would each
-      # carry the stdenv bootstrap chain the others already have — a blob is one
-      # opaque file, so the store cannot share it the way it shares .drv paths.
-      recipeDrv = name:
-        builtins.unsafeDiscardOutputDependency (declFor name).package.drvPath;
+      # The recipe for EVERY set, packed once. Per-stub (or per-set) blobs would
+      # each carry the stdenv bootstrap chain the others already have — a blob
+      # is one opaque file, so the store cannot share it the way it shares .drv
+      # paths.
+      recipeDrv = s: name:
+        builtins.unsafeDiscardOutputDependency (declFor s name).package.drvPath;
 
       sharedRecipe = import ./recipe.nix { pkgs = prev; nix-stubs = pkg; } {
         name = "stub-set";
-        drvs = map recipeDrv (builtins.attrNames locked);
+        # Sorted and unique, so splitting sets never changes the blob.
+        drvs = lib.unique (lib.sort builtins.lessThan
+          (lib.concatMap (s: map (recipeDrv s) (builtins.attrNames s.locked)) (lib.attrValues loaded)));
       };
 
       # Iterating the LOCK rather than the declarations is what keeps this
@@ -178,9 +266,9 @@ in
       # package set is complete, and the lock supplies them as plain strings.
       # Deriving a name from a declaration instead means forcing `prev.<attr>`
       # mid-construction, which is an infinite recursion.
-      stubFor = name: entry:
+      stubFor = s: name: entry:
         let
-          d = declFor name;
+          d = declFor s name;
           real = d.package;
           # The lock wins over the declaration: it is where `--discover-bins`
           # results are recorded, and `check` keeps the two from disagreeing.
@@ -221,5 +309,6 @@ in
           };
         });
     in
-    lib.optionalAttrs synced (lib.mapAttrs' stubFor locked);
+    lib.optionalAttrs ok
+      (lib.foldl' (acc: s: acc // lib.mapAttrs' (stubFor s) s.locked) { } (lib.attrValues loaded));
 }

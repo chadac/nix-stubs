@@ -141,18 +141,45 @@ pub fn build_lock(opts: &GenOpts) -> Result<Lock, String> {
     Ok(out)
 }
 
-pub fn cmd_gen(opts: GenOpts) {
+/// One `stubSets` entry: where its locks live.
+#[derive(Deserialize)]
+pub struct SetSpec {
+    /// Where the set's stubs.lock lives, relative to the flake.
+    pub lock: String,
+    /// The flake.lock it is synced to, relative to the flake.
+    #[serde(rename = "flakeLock")]
+    pub flake_lock: String,
+}
+
+/// Reads only the paths, so listing sets evaluates no stubs.
+const SET_SPECS: &str = r#"
+builtins.mapAttrs (name: s: {
+  lock = s.lock or (throw "stubSets.${name} has no `lock`");
+  flakeLock = s.flakeLock or "flake.lock";
+})
+"#;
+
+/// The flake's `stubSets`, or None if it only has `stubs`.
+pub fn stub_sets(flake: &str) -> Result<Option<BTreeMap<String, SetSpec>>, String> {
+    let target = format!("{flake}#stubSets");
+    match nix(&["eval", "--json", &target, "--apply", SET_SPECS]) {
+        Ok(json) => {
+            let sets: BTreeMap<String, SetSpec> = serde_json::from_str(&json)
+                .map_err(|e| format!("{target}: `lock` and `flakeLock` must be strings: {e}"))?;
+            Ok(Some(sets))
+        }
+        Err(e) if e.contains("does not provide attribute") => Ok(None),
+        Err(e) => Err(format!("failed to evaluate {target}\n{e}")),
+    }
+}
+
+/// Regenerate one lock. Ok carries what to report.
+pub fn gen(opts: &GenOpts) -> Result<String, String> {
     // Systems the existing lock covers but this run didn't regenerate are
     // carried over, so locking on one machine doesn't drop another's entries.
     let existing = Lock::read(&opts.lock_path).ok();
 
-    let mut new = match build_lock(&opts) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("nix-stubs: {e}");
-            std::process::exit(1);
-        }
-    };
+    let mut new = build_lock(opts)?;
 
     if let Some(old) = &existing {
         for (system, entries) in &old.packages {
@@ -163,60 +190,45 @@ pub fn cmd_gen(opts: GenOpts) {
     }
 
     if existing.as_ref() == Some(&new) {
-        println!("nix-stubs: {} is already up to date", opts.lock_path);
-        return;
+        return Ok(format!("{} is already up to date", opts.lock_path));
     }
 
-    if let Err(e) = new.write(&opts.lock_path) {
-        eprintln!("nix-stubs: {e}");
-        std::process::exit(1);
-    }
+    new.write(&opts.lock_path)?;
     let n: usize = new.packages.values().map(|p| p.len()).sum();
-    println!(
-        "nix-stubs: wrote {} ({n} stubs across {} system(s))",
+    Ok(format!(
+        "wrote {} ({n} stubs across {} system(s))",
         opts.lock_path,
         new.packages.len()
-    );
+    ))
 }
 
-pub fn cmd_check(opts: GenOpts, fast: bool) {
-    let committed = match Lock::read(&opts.lock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("nix-stubs: {e}");
-            std::process::exit(1);
-        }
-    };
+/// Check one lock. Err carries the full report.
+pub fn check(opts: GenOpts, fast: bool) -> Result<String, String> {
+    let committed = Lock::read(&opts.lock_path)?;
 
     // Stage 1 — inputs. Pure JSON comparison, no evaluation, instant. This is
     // the check that catches the common case: flake.lock moved, nobody relocked.
-    let flake_lock = match lock::read_flake_lock(&opts.flake_lock_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("nix-stubs: {e}");
-            std::process::exit(1);
-        }
-    };
+    let flake_lock = lock::read_flake_lock(&opts.flake_lock_path)?;
     let errs = lock::sync_errors(&committed, &flake_lock);
     if !errs.is_empty() {
-        eprintln!(
-            "nix-stubs: {} is out of sync with flake.lock\n",
-            opts.lock_path
+        let mut report = format!(
+            "{} is out of sync with {}\n\n",
+            opts.lock_path, opts.flake_lock_path
         );
         for e in &errs {
-            eprintln!("  {e}\n");
+            report += &format!("  {e}\n\n");
         }
-        eprintln!("Regenerate with: nix run github:chadac/nix-stubs#gen");
-        std::process::exit(1);
+        report += "Regenerate with: nix run github:chadac/nix-stubs#gen";
+        return Err(report);
     }
 
     if fast {
-        println!(
-            "nix-stubs: {} inputs match flake.lock ({} pinned)",
+        return Ok(format!(
+            "{} inputs match {} ({} pinned)",
             opts.lock_path,
+            opts.flake_lock_path,
             committed.inputs.len()
-        );
-        return;
+        ));
     }
 
     // Stage 2 — re-evaluate and compare drv paths. Catches drift the input
@@ -226,38 +238,31 @@ pub fn cmd_check(opts: GenOpts, fast: bool) {
         inputs: committed.inputs.keys().cloned().collect(),
         ..opts
     };
-    let fresh = match build_lock(&opts) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("nix-stubs: {e}");
-            std::process::exit(1);
-        }
-    };
+    let fresh = build_lock(&opts)?;
 
     if fresh == committed {
         let n: usize = committed.packages.values().map(|p| p.len()).sum();
-        println!("nix-stubs: {} is up to date ({n} stubs)", opts.lock_path);
-        return;
+        return Ok(format!("{} is up to date ({n} stubs)", opts.lock_path));
     }
 
-    eprintln!("nix-stubs: {} does not match stubs.nix\n", opts.lock_path);
+    let mut report = format!("{} does not match its stubs.nix\n\n", opts.lock_path);
     for (system, entries) in &fresh.packages {
         let old = committed.packages.get(system);
         for (name, e) in entries {
             match old.and_then(|o| o.get(name)) {
-                None => eprintln!("  + {system}.{name}  {}", e.name),
+                None => report += &format!("  + {system}.{name}  {}\n", e.name),
                 Some(prev) if prev != e => {
-                    eprintln!("  ~ {system}.{name}  {} -> {}", prev.name, e.name)
+                    report += &format!("  ~ {system}.{name}  {} -> {}\n", prev.name, e.name)
                 }
                 Some(_) => {}
             }
         }
         if let Some(old) = old {
             for name in old.keys().filter(|k| !entries.contains_key(*k)) {
-                eprintln!("  - {system}.{name}");
+                report += &format!("  - {system}.{name}\n");
             }
         }
     }
-    eprintln!("\nRegenerate with: nix run github:chadac/nix-stubs#gen");
-    std::process::exit(1);
+    report += "\nRegenerate with: nix run github:chadac/nix-stubs#gen";
+    Err(report)
 }
